@@ -1,0 +1,41 @@
+[paper]
+starting_capital_paise = 1000000 # ₹10,000.00
+max_trade_value_paise = 200000   # ₹2,000.00
+max_open_positions = 3
+max_daily_loss_paise = 50000     # ₹500.00
+max_position_quantity = 50
+allow_short = false
+spread_bps = 10
+slippage_bps = 5
+fee_bps = 3
+partial_fill_fraction = 1.0
+
+[analysis]
+mode = "hybrid"
+bar_minutes = 5
+stale_after_seconds = 15
+worker_count = 10
+subleader_count = 2
+driver_count = 1
+worker_timeout_seconds = 25
+
+[groq]
+base_url = "https://api.groq.com/openai/v1/chat/completions"
+worker_model = "SET_GROQ_WORKER_MODEL"
+subleader_model = "SET_GROQ_SUBLEADER_MODEL"
+driver_model = "SET_GROQ_DRIVER_MODEL"
+max_concurrent_requests = 10
+requests_per_minute = 30
+max_tokens_worker = 300
+max_tokens_subleader = 500
+max_tokens_driver = 600
+temperature = 0.1
+
+[indstocks]
+# TODO: verify current official REST/WebSocket base URLs, auth headers, instrument IDs,
+# response fields and subscription message against your INDstocks API version.
+rest_base_url = "https://REPLACE_WITH_VERIFIED_INDSTOCKS_REST_HOST"
+websocket_url = "wss://REPLACE_WITH_VERIFIED_INDSTOCKS_WEBSOCKET_HOST"
+quote_path = "/REPLACE_WITH_VERIFIED_QUOTE_PATH"
+market_data_enabled = false
+symbol = "NIFTY"
