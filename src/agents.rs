@@ -1,5 +1,5 @@
 use crate::{
-    config::Groq,
+    config::Llm,
     types::{AgentOpinion, MarketSnapshot},
 };
 use anyhow::{bail, Context, Result};
@@ -11,9 +11,9 @@ use tokio::{
 };
 
 #[derive(Clone)]
-pub struct GroqOrchestrator {
+pub struct GeminiOrchestrator {
     client: reqwest::Client,
-    config: Groq,
+    config: Llm,
     key: String,
     gate: Arc<Semaphore>,
     last_request: Arc<Mutex<Option<Instant>>>,
@@ -23,9 +23,8 @@ struct Request<'a> {
     model: &'a str,
     messages: [Message<'a>; 1],
     temperature: f32,
-    max_completion_tokens: u32,
+    max_tokens: u32,
     reasoning_effort: &'static str,
-    include_reasoning: bool,
     response_format: Format,
 }
 #[derive(Serialize)]
@@ -51,8 +50,8 @@ struct Content {
     content: String,
 }
 
-impl GroqOrchestrator {
-    pub fn new(config: Groq, key: String) -> Self {
+impl GeminiOrchestrator {
+    pub fn new(config: Llm, key: String) -> Self {
         let permits = config.max_concurrent_requests.max(1);
         Self {
             client: reqwest::Client::new(),
@@ -88,9 +87,8 @@ impl GroqOrchestrator {
                 content: &user_prompt,
             }],
             temperature: self.config.temperature,
-            max_completion_tokens: max_tokens,
-            reasoning_effort: "low",
-            include_reasoning: false,
+            max_tokens,
+            reasoning_effort: "minimal",
             response_format: Format {
                 kind: "json_object",
             },
@@ -105,13 +103,13 @@ impl GroqOrchestrator {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            bail!("Groq API returned HTTP {status}: {error_body}");
+            bail!("Gemini API returned HTTP {status}: {error_body}");
         }
-        let response: Response = response.json().await.context("decode Groq response")?;
+        let response: Response = response.json().await.context("decode Gemini response")?;
         let json = response
             .choices
             .first()
-            .context("Groq returned no choices")?
+            .context("Gemini returned no choices")?
             .message
             .content
             .trim();
@@ -126,7 +124,7 @@ impl GroqOrchestrator {
             || self.config.subleader_model.starts_with("SET_")
             || self.config.driver_model.starts_with("SET_")
         {
-            bail!("configure Groq model IDs in settings.toml")
+            bail!("configure Gemini model IDs in settings.toml")
         }
         let parts = partition(snapshot);
         let mut jobs = Vec::new();
@@ -192,7 +190,7 @@ impl GroqOrchestrator {
 }
 
 #[async_trait::async_trait]
-impl crate::backtest::BacktestPolicy for GroqOrchestrator {
+impl crate::backtest::BacktestPolicy for GeminiOrchestrator {
     async fn decide(
         &self,
         snapshot: &MarketSnapshot,

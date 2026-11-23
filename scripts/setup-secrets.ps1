@@ -9,8 +9,8 @@ function Read-SecretValue([string] $Prompt) {
 }
 
 $accessToken = Read-SecretValue 'INDstocks access token'
-$groqKey = Read-SecretValue 'Groq API key'
-foreach ($value in @($accessToken, $groqKey)) {
+$geminiKey = Read-SecretValue 'Google Gemini API key'
+foreach ($value in @($accessToken, $geminiKey)) {
     if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains("`r") -or $value.Contains("`n")) {
         throw 'Keys must be non-empty single-line values. No .env file was written.'
     }
@@ -18,7 +18,7 @@ foreach ($value in @($accessToken, $groqKey)) {
 
 $lines = @(
     "INDSTOCKS_ACCESS_TOKEN=$accessToken"
-    "GROQ_API_KEY=$groqKey"
+    "GEMINI_API_KEY=$geminiKey"
 )
 [IO.File]::WriteAllLines($envPath, [string[]]$lines, [Text.UTF8Encoding]::new($false))
 Write-Output 'Saved credentials to .env. Values were not displayed.'

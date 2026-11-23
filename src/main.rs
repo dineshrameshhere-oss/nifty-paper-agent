@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nifty_paper_agent::{
-    agents::GroqOrchestrator,
+    agents::GeminiOrchestrator,
     backtest::{fetch_yahoo_nifty_5m, load_index_history, run_agent_backtest},
     config::Settings,
     journal::Journal,
@@ -29,16 +29,18 @@ async fn main() -> Result<()> {
             .windows(2)
             .find(|pair| pair[0] == "--max-decisions")
             .and_then(|p| p[1].parse::<usize>().ok())
-            .unwrap_or(10);
+            .unwrap_or(1);
         let bars = if std::path::Path::new(data_path).exists() {
             load_index_history(data_path)?
         } else {
             fetch_yahoo_nifty_5m(data_path).await?
         };
-        let key = std::env::var("GROQ_API_KEY").map_err(|_| {
-            anyhow::anyhow!("set GROQ_API_KEY with scripts/setup-secrets before backtesting")
+        let key = std::env::var("GEMINI_API_KEY").map_err(|_| {
+            anyhow::anyhow!(
+                "set GEMINI_API_KEY with scripts/update-gemini-key.sh before backtesting"
+            )
         })?;
-        let policy = GroqOrchestrator::new(settings.groq.clone(), key);
+        let policy = GeminiOrchestrator::new(settings.llm.clone(), key);
         let synthetic_config = nifty_paper_agent::backtest::config_for_bars(&bars);
         let report = run_agent_backtest(
             &bars,

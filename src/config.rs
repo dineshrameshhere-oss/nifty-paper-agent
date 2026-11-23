@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 pub struct Settings {
     pub paper: Paper,
     pub analysis: Analysis,
-    pub groq: Groq,
+    pub llm: Llm,
     pub indstocks: Indstocks,
 }
 #[derive(Clone, Debug, Deserialize)]
@@ -33,7 +33,7 @@ pub struct Analysis {
     pub worker_timeout_seconds: u64,
 }
 #[derive(Clone, Debug, Deserialize)]
-pub struct Groq {
+pub struct Llm {
     pub base_url: String,
     pub worker_model: String,
     pub subleader_model: String,

@@ -19,17 +19,17 @@ subleader_count = 2
 driver_count = 1
 worker_timeout_seconds = 25
 
-[groq]
-base_url = "https://api.groq.com/openai/v1/chat/completions"
-worker_model = "SET_GROQ_WORKER_MODEL"
-subleader_model = "SET_GROQ_SUBLEADER_MODEL"
-driver_model = "SET_GROQ_DRIVER_MODEL"
+[llm]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+worker_model = "gemini-3.1-flash-lite"
+subleader_model = "gemini-3.1-flash-lite"
+driver_model = "gemini-3.1-flash-lite"
 max_concurrent_requests = 10
-requests_per_minute = 3
+requests_per_minute = 5
 max_tokens_worker = 400
 max_tokens_subleader = 500
 max_tokens_driver = 600
-temperature = 0.1
+temperature = 0.2
 
 [indstocks]
 # TODO: verify current official REST/WebSocket base URLs, auth headers, instrument IDs,
