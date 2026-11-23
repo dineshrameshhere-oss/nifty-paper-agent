@@ -4,7 +4,13 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{Mutex, Semaphore},
     time::Instant,
@@ -17,6 +23,7 @@ pub struct GeminiOrchestrator {
     key: String,
     gate: Arc<Semaphore>,
     last_request: Arc<Mutex<Option<Instant>>>,
+    fallback_active: Arc<AtomicBool>,
 }
 #[derive(Serialize)]
 struct Request<'a> {
@@ -59,6 +66,7 @@ impl GeminiOrchestrator {
             key,
             gate: Arc::new(Semaphore::new(permits)),
             last_request: Arc::new(Mutex::new(None)),
+            fallback_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -84,22 +92,27 @@ impl GeminiOrchestrator {
         let user_prompt = format!(
             "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, entry_price, target_price, stop_loss_price, trailing_stop_loss_price, confidence_bps, rationale, and snapshot_id. All four prices are option premiums in the same units as the quoted option. The agent must choose them; never calculate or fill in missing plan prices."
         ) + &format!("\n\nInput and evidence:\n{prompt}");
-        let body = Request {
-            model,
-            messages: [Message {
-                role: "user",
-                content: &user_prompt,
-            }],
-            temperature: self.config.temperature,
-            max_tokens,
-            reasoning_effort: "minimal",
-            response_format: Format {
-                kind: "json_object",
-            },
-        };
         let mut retry = 0u32;
         let response = loop {
             self.wait_for_request_slot().await?;
+            let selected_model = if self.fallback_active.load(Ordering::Relaxed) {
+                self.config.fallback_model.as_str()
+            } else {
+                model
+            };
+            let body = Request {
+                model: selected_model,
+                messages: [Message {
+                    role: "user",
+                    content: &user_prompt,
+                }],
+                temperature: self.config.temperature,
+                max_tokens,
+                reasoning_effort: "minimal",
+                response_format: Format {
+                    kind: "json_object",
+                },
+            };
             let response = self
                 .client
                 .post(&self.config.base_url)
@@ -107,12 +120,24 @@ impl GeminiOrchestrator {
                 .json(&body)
                 .send()
                 .await?;
-            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || retry >= 2 {
+            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 break response;
             }
-            // Drain the temporary error before retrying; each retry also passes through
-            // the same RPM gate. Do not retry 429s, since those indicate account quotas.
+            // Drain the temporary error before retrying. Every attempt, including fallback,
+            // passes through the same RPM gate. Do not retry 429 quota errors.
             let _ = response.bytes().await;
+            let is_fallback = selected_model == self.config.fallback_model;
+            if is_fallback && retry >= 2 {
+                bail!("Gemini primary and fallback models are unavailable (HTTP 503)")
+            }
+            if !is_fallback && retry >= 2 {
+                if !self.config.fallback_model.is_empty() && self.config.fallback_model != model {
+                    self.fallback_active.store(true, Ordering::Relaxed);
+                    retry = 0;
+                    continue;
+                }
+                bail!("Gemini model unavailable and no distinct fallback model is configured")
+            }
             tokio::time::sleep(Duration::from_secs(2u64.pow(retry))).await;
             retry += 1;
         };
@@ -139,6 +164,7 @@ impl GeminiOrchestrator {
         if self.config.worker_model.starts_with("SET_")
             || self.config.subleader_model.starts_with("SET_")
             || self.config.driver_model.starts_with("SET_")
+            || self.config.fallback_model.starts_with("SET_")
         {
             bail!("configure Gemini model IDs in settings.toml")
         }

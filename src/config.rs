@@ -38,6 +38,7 @@ pub struct Llm {
     pub worker_model: String,
     pub subleader_model: String,
     pub driver_model: String,
+    pub fallback_model: String,
     pub max_concurrent_requests: usize,
     pub requests_per_minute: usize,
     pub max_tokens_worker: u32,
