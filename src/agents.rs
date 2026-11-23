@@ -21,10 +21,11 @@ pub struct GroqOrchestrator {
 #[derive(Serialize)]
 struct Request<'a> {
     model: &'a str,
-    messages: [Message<'a>; 2],
+    messages: [Message<'a>; 1],
     temperature: f32,
     max_completion_tokens: u32,
-    reasoning_format: &'static str,
+    reasoning_effort: &'static str,
+    include_reasoning: bool,
     response_format: Format,
 }
 #[derive(Serialize)]
@@ -77,24 +78,19 @@ impl GroqOrchestrator {
         }
         *last = Some(Instant::now());
         drop(last);
-        let system_prompt = format!(
+        let user_prompt = format!(
             "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, limit_price, confidence_bps, rationale, and snapshot_id."
-        );
+        ) + &format!("\n\nInput and evidence:\n{prompt}");
         let body = Request {
             model,
-            messages: [
-                Message {
-                    role: "system",
-                    content: &system_prompt,
-                },
-                Message {
-                    role: "user",
-                    content: prompt,
-                },
-            ],
+            messages: [Message {
+                role: "user",
+                content: &user_prompt,
+            }],
             temperature: self.config.temperature,
             max_completion_tokens: max_tokens,
-            reasoning_format: "hidden",
+            reasoning_effort: "low",
+            include_reasoning: false,
             response_format: Format {
                 kind: "json_object",
             },
