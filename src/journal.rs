@@ -1,8 +1,10 @@
+use crate::types::{Fill, Signal};
 use anyhow::Result;
 use rusqlite::{params, Connection};
-use crate::types::{Fill, Signal};
 
-pub struct Journal { conn: Connection }
+pub struct Journal {
+    conn: Connection,
+}
 impl Journal {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;

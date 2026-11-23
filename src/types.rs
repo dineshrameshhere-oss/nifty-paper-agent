@@ -21,7 +21,10 @@ pub struct MarketSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum Side { Buy, Sell }
+pub enum Side {
+    Buy,
+    Sell,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Signal {
