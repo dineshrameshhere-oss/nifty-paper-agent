@@ -61,6 +61,18 @@ impl GeminiOrchestrator {
             last_request: Arc::new(Mutex::new(None)),
         }
     }
+
+    async fn wait_for_request_slot(&self) -> Result<()> {
+        // Simple global spacing limiter: safe under the configured RPM, though it does not burst.
+        let min_gap = Duration::from_secs_f64(60.0 / self.config.requests_per_minute.max(1) as f64);
+        let mut last = self.last_request.lock().await;
+        if let Some(at) = *last {
+            tokio::time::sleep(min_gap.saturating_sub(at.elapsed())).await;
+        }
+        *last = Some(Instant::now());
+        Ok(())
+    }
+
     async fn complete<T: for<'de> Deserialize<'de>>(
         &self,
         model: &str,
@@ -69,14 +81,6 @@ impl GeminiOrchestrator {
         max_tokens: u32,
     ) -> Result<T> {
         let _permit = self.gate.acquire().await?;
-        // Simple global spacing limiter: safe under the configured RPM, though it does not burst.
-        let min_gap = Duration::from_secs_f64(60.0 / self.config.requests_per_minute.max(1) as f64);
-        let mut last = self.last_request.lock().await;
-        if let Some(at) = *last {
-            tokio::time::sleep(min_gap.saturating_sub(at.elapsed())).await;
-        }
-        *last = Some(Instant::now());
-        drop(last);
         let user_prompt = format!(
             "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, entry_price, target_price, stop_loss_price, trailing_stop_loss_price, confidence_bps, rationale, and snapshot_id. All four prices are option premiums in the same units as the quoted option. The agent must choose them; never calculate or fill in missing plan prices."
         ) + &format!("\n\nInput and evidence:\n{prompt}");
@@ -93,13 +97,25 @@ impl GeminiOrchestrator {
                 kind: "json_object",
             },
         };
-        let response = self
-            .client
-            .post(&self.config.base_url)
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .await?;
+        let mut retry = 0u32;
+        let response = loop {
+            self.wait_for_request_slot().await?;
+            let response = self
+                .client
+                .post(&self.config.base_url)
+                .bearer_auth(&self.key)
+                .json(&body)
+                .send()
+                .await?;
+            if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE || retry >= 2 {
+                break response;
+            }
+            // Drain the temporary error before retrying; each retry also passes through
+            // the same RPM gate. Do not retry 429s, since those indicate account quotas.
+            let _ = response.bytes().await;
+            tokio::time::sleep(Duration::from_secs(2u64.pow(retry))).await;
+            retry += 1;
+        };
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
