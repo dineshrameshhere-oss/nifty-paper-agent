@@ -8,17 +8,15 @@ function Read-SecretValue([string] $Prompt) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
 }
 
-$apiKey = Read-SecretValue 'INDstocks API key'
 $accessToken = Read-SecretValue 'INDstocks access token'
 $groqKey = Read-SecretValue 'Groq API key'
-foreach ($value in @($apiKey, $accessToken, $groqKey)) {
+foreach ($value in @($accessToken, $groqKey)) {
     if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains("`r") -or $value.Contains("`n")) {
         throw 'Keys must be non-empty single-line values. No .env file was written.'
     }
 }
 
 $lines = @(
-    "INDSTOCKS_API_KEY=$apiKey"
     "INDSTOCKS_ACCESS_TOKEN=$accessToken"
     "GROQ_API_KEY=$groqKey"
 )

@@ -28,7 +28,7 @@ cargo test
 cargo run --release
 ```
 
-The setup script prompts for all three secrets without displaying them. To replace just the daily INDstocks token later, run `bash scripts/update-indstocks-token.sh`; it preserves the other `.env` entries.
+The setup script prompts for the INDstocks access token and Groq API key without displaying them. INDstocks calls use the access token; a separate API key is not needed for this adapter. To replace just the daily INDstocks token later, run `bash scripts/update-indstocks-token.sh`; it preserves the other `.env` entries.
 
 ## Synthetic options backtest
 
