@@ -79,13 +79,22 @@ impl BacktestPolicy for RoundTripPolicy {
             *self.symbol.lock().unwrap() = Some(q.symbol.clone());
             (q.symbol.clone(), Side::Buy)
         };
+        let quote = snapshot.quotes.iter().find(|q| q.symbol == symbol).unwrap();
+        let plan_entry = if side == Side::Buy {
+            quote.ask * 1.5
+        } else {
+            quote.bid
+        };
         Ok(Some(Signal {
             id: format!("{}-{}", symbol, snapshot.created_at.timestamp()),
             source: "test".into(),
             symbol,
             side,
             quantity: 1,
-            limit_price: 10000.0,
+            entry_price: plan_entry,
+            target_price: plan_entry * 3.0,
+            stop_loss_price: quote.ask * 0.3,
+            trailing_stop_loss_price: quote.ask * 0.6,
             confidence_bps: 9000,
             rationale: "test".into(),
             snapshot_id: Some(snapshot.id),

@@ -54,8 +54,15 @@ impl PaperBroker {
                 + direction
                     * (self.config.spread_bps as f64 / 2.0 + self.config.slippage_bps as f64)
                     / 10_000.0);
-        if (signal.side == Side::Buy && px > signal.limit_price)
-            || (signal.side == Side::Sell && px < signal.limit_price)
+        if signal.side == Side::Buy
+            && (px <= signal.stop_loss_price
+                || px <= signal.trailing_stop_loss_price
+                || px >= signal.target_price)
+        {
+            bail!("simulated entry falls outside the agent-selected trade plan")
+        }
+        if (signal.side == Side::Buy && px > signal.entry_price)
+            || (signal.side == Side::Sell && px < signal.entry_price)
         {
             bail!("simulated price exceeds signal limit")
         }

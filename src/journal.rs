@@ -15,7 +15,7 @@ impl Journal {
     }
     pub fn record_signal(&self, s: &Signal) -> Result<bool> {
         let n = self.conn.execute("INSERT OR IGNORE INTO signals(id,source,symbol,side,quantity,price,rationale) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params![s.id,s.source,s.symbol,format!("{:?}",s.side),s.quantity,s.limit_price,s.rationale])?;
+            params![s.id,s.source,s.symbol,format!("{:?}",s.side),s.quantity,s.entry_price,s.rationale])?;
         Ok(n == 1)
     }
     pub fn record_fill(&self, f: &Fill) -> Result<()> {

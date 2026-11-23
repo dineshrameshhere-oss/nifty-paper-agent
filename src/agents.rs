@@ -78,7 +78,7 @@ impl GeminiOrchestrator {
         *last = Some(Instant::now());
         drop(last);
         let user_prompt = format!(
-            "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, limit_price, confidence_bps, rationale, and snapshot_id."
+            "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, entry_price, target_price, stop_loss_price, trailing_stop_loss_price, confidence_bps, rationale, and snapshot_id. All four prices are option premiums in the same units as the quoted option. The agent must choose them; never calculate or fill in missing plan prices."
         ) + &format!("\n\nInput and evidence:\n{prompt}");
         let body = Request {
             model,
@@ -175,7 +175,7 @@ impl GeminiOrchestrator {
         self.analyze_with_driver(snapshot,"Driver: synthesize both subleaders into one final assessment. Preserve signal=null; the live starter has no autonomous order authorization.").await
     }
     pub async fn analyze_backtest(&self, snapshot: &MarketSnapshot) -> Result<AgentOpinion> {
-        self.analyze_with_driver(snapshot,"Driver: make a paper-backtest decision from the historical snapshot. If flat, optionally emit one BUY signal for an exact quoted synthetic NIFTY option symbol; quantity is one lot and limit_price must be no higher than that quote's ask. If already holding, only emit SELL to close that same symbol at no less than its bid, otherwise signal=null. Never short, invent symbols/prices, or use future data. Return the required JSON fields.").await
+        self.analyze_with_driver(snapshot,"Driver: make a paper-backtest decision from the historical snapshot. If flat, optionally emit one BUY signal for an exact quoted synthetic NIFTY option symbol; quantity is one lot. The agent alone must select expected entry_price, target_price, stop_loss_price, and initial trailing_stop_loss_price in option-premium units. Set entry_price at or above the current ask to reflect an acceptable expected entry; require 0 < stop_loss_price < trailing_stop_loss_price <= entry_price < target_price. If already holding, only emit SELL to close that same symbol when the agent's plan says to exit, otherwise signal=null. Never short, invent symbols/prices, or use future data. Return all required plan fields on any signal.").await
     }
     async fn lead(
         &self,

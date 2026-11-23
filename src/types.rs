@@ -33,7 +33,12 @@ pub struct Signal {
     pub symbol: String,
     pub side: Side,
     pub quantity: u32,
-    pub limit_price: f64,
+    /// Agent-selected expected option premium entry, used as a hard price cap for buys.
+    pub entry_price: f64,
+    /// Agent-selected option-premium exit levels.
+    pub target_price: f64,
+    pub stop_loss_price: f64,
+    pub trailing_stop_loss_price: f64,
     pub confidence_bps: u16,
     pub rationale: String,
     pub snapshot_id: Option<Uuid>,

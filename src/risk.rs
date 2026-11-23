@@ -12,14 +12,12 @@ pub fn check_signal(
     open_positions: usize,
     daily_loss_paise: i64,
 ) -> Result<()> {
+    check_agent_plan(signal)?;
     if signal.id.trim().is_empty() || signal.symbol != quote.symbol {
         bail!("signal identity/symbol invalid")
     }
     if signal.quantity == 0 || signal.quantity > paper.max_position_quantity {
         bail!("quantity limit")
-    }
-    if !signal.limit_price.is_finite() || signal.limit_price <= 0.0 {
-        bail!("invalid price")
     }
     if signal.confidence_bps > 10_000 {
         bail!("confidence out of range")
@@ -30,7 +28,7 @@ pub fn check_signal(
     if open_positions >= paper.max_open_positions {
         bail!("open position limit")
     }
-    let value = signal.limit_price * signal.quantity as f64 * 100.0;
+    let value = signal.entry_price * signal.quantity as f64 * 100.0;
     if value > paper.max_trade_value_paise as f64 {
         bail!("per-trade capital limit")
     }
@@ -39,6 +37,25 @@ pub fn check_signal(
     }
     if signal.side == Side::Sell && !paper.allow_short {
         bail!("short selling disabled")
+    }
+    Ok(())
+}
+
+/// Checks agent-selected prices without deriving or modifying any level.
+pub fn check_agent_plan(signal: &Signal) -> Result<()> {
+    if !signal.entry_price.is_finite() || signal.entry_price <= 0.0 {
+        bail!("invalid agent entry price")
+    }
+    if signal.side == Side::Buy
+        && (!signal.target_price.is_finite()
+            || !signal.stop_loss_price.is_finite()
+            || !signal.trailing_stop_loss_price.is_finite()
+            || signal.stop_loss_price <= 0.0
+            || signal.stop_loss_price >= signal.trailing_stop_loss_price
+            || signal.trailing_stop_loss_price > signal.entry_price
+            || signal.entry_price >= signal.target_price)
+    {
+        bail!("agent trade plan levels invalid; require stop < trail <= entry < target")
     }
     Ok(())
 }

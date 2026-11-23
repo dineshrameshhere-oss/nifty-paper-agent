@@ -60,6 +60,11 @@ pub struct BacktestPosition {
     pub lots: u32,
     pub lot_size: u32,
     pub entry_price: f64,
+    pub target_price: f64,
+    pub stop_loss_price: f64,
+    pub trailing_stop_loss_price: f64,
+    pub trailing_distance: f64,
+    pub highest_option_price: f64,
     pub entry_fees: f64,
     pub entry_time: DateTime<Utc>,
 }
@@ -70,6 +75,9 @@ pub struct BacktestTrade {
     pub entry_time: DateTime<Utc>,
     pub exit_time: DateTime<Utc>,
     pub entry_price: f64,
+    pub target_price: f64,
+    pub stop_loss_price: f64,
+    pub trailing_stop_loss_price: f64,
     pub exit_price: f64,
     pub fees: f64,
     pub pnl_rupees: f64,
@@ -408,10 +416,66 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                 )?);
             }
         }
+        // Agent-selected target and protective levels are monitored against each completed
+        // synthetic option candle. If a candle touches both stop and target, assume the stop
+        // was hit first because OHLC bars do not reveal intrabar ordering.
+        if let Some(p) = position.as_mut() {
+            if let Some(q) = chain.iter().find(|q| q.symbol == p.symbol) {
+                let protective_stop = p.stop_loss_price.max(p.trailing_stop_loss_price);
+                let exit_raw = if q.low <= protective_stop {
+                    Some(if q.open <= protective_stop {
+                        q.open
+                    } else {
+                        protective_stop
+                    })
+                } else if q.high >= p.target_price {
+                    Some(if q.open >= p.target_price {
+                        q.open
+                    } else {
+                        p.target_price
+                    })
+                } else {
+                    None
+                };
+                if let Some(exit_raw) = exit_raw {
+                    let p = position.take().unwrap();
+                    let fill = (exit_raw
+                        * (1.0
+                            - config.spread_bps as f64 / 20_000.0
+                            - paper.slippage_bps as f64 / 10_000.0))
+                        .max(0.05);
+                    let fees =
+                        fill * p.lot_size as f64 * p.lots as f64 * paper.fee_bps as f64 / 10_000.0;
+                    cash += fill * p.lot_size as f64 * p.lots as f64 - fees;
+                    let pnl = (fill - p.entry_price) * p.lot_size as f64 * p.lots as f64
+                        - p.entry_fees
+                        - fees;
+                    trades.push(BacktestTrade {
+                        symbol: p.symbol,
+                        lots: p.lots,
+                        entry_time: p.entry_time,
+                        exit_time: bars[i].timestamp,
+                        entry_price: p.entry_price,
+                        target_price: p.target_price,
+                        stop_loss_price: p.stop_loss_price,
+                        trailing_stop_loss_price: p.trailing_stop_loss_price,
+                        exit_price: fill,
+                        fees: p.entry_fees + fees,
+                        pnl_rupees: pnl,
+                    });
+                    *daily_pnl.entry(bars[i].timestamp.date_naive()).or_default() += pnl;
+                } else {
+                    p.highest_option_price = p.highest_option_price.max(q.high);
+                    p.trailing_stop_loss_price = p
+                        .trailing_stop_loss_price
+                        .max(p.highest_option_price - p.trailing_distance);
+                }
+            }
+        }
         let snapshot=MarketSnapshot {id:uuid::Uuid::new_v4(),created_at:bars[i].timestamp,
             quotes:chain.iter().map(|q|Quote{symbol:q.symbol.clone(),bid:q.bid,ask:q.ask,last:q.close,timestamp:bars[i].timestamp}).collect(),
             context:format!("HISTORICAL NIFTY BAR; spot O/H/L/C={:.2}/{:.2}/{:.2}/{:.2}; volume={}; synthetic_iv={:.4}; expiry schedule uses current NSE Tuesday rule after 2025-09 and prior Thursday rule before. {}",
-                bars[i].open,bars[i].high,bars[i].low,bars[i].close,bars[i].volume,iv,position.as_ref().map(|p|format!("OPEN LONG {} lots={} entry={:.2}",p.symbol,p.lots,p.entry_price)).unwrap_or_else(||"FLAT".into()))};
+                bars[i].open,bars[i].high,bars[i].low,bars[i].close,bars[i].volume,iv,position.as_ref().map(|p|format!("OPEN LONG {} lots={} agent_entry={:.2} agent_target={:.2} agent_stop={:.2} current_agent_trail={:.2}",p.symbol,p.lots,p.entry_price,p.target_price,p.stop_loss_price,p.trailing_stop_loss_price)).unwrap_or_else(||"FLAT".into()))};
         let marked = position
             .as_ref()
             .map(|p| {
@@ -429,6 +493,9 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
         let Some(signal) = policy.decide(&snapshot, position.as_ref()).await? else {
             continue;
         };
+        if crate::risk::check_agent_plan(&signal).is_err() {
+            continue;
+        }
         if signal.snapshot_id.is_some_and(|id| id != snapshot.id) || signal.confidence_bps > 10_000
         {
             continue;
@@ -460,7 +527,10 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                 * (1.0
                     + config.spread_bps as f64 / 20_000.0
                     + paper.slippage_bps as f64 / 10_000.0);
-            if fill > signal.limit_price
+            if fill > signal.entry_price
+                || fill <= signal.stop_loss_price
+                || fill <= signal.trailing_stop_loss_price
+                || fill >= signal.target_price
                 || fill * contract.lot_size as f64 * lots as f64 > max_trade
                 || fill * contract.lot_size as f64 * lots as f64 > cash
             {
@@ -481,6 +551,11 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                 lots,
                 lot_size: contract.lot_size,
                 entry_price: fill,
+                target_price: signal.target_price,
+                stop_loss_price: signal.stop_loss_price,
+                trailing_stop_loss_price: signal.trailing_stop_loss_price,
+                trailing_distance: signal.entry_price - signal.trailing_stop_loss_price,
+                highest_option_price: fill,
                 entry_fees: fees,
                 entry_time: next.timestamp,
             });
@@ -504,6 +579,9 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                     entry_time: p.entry_time,
                     exit_time: next.timestamp,
                     entry_price: p.entry_price,
+                    target_price: p.target_price,
+                    stop_loss_price: p.stop_loss_price,
+                    trailing_stop_loss_price: p.trailing_stop_loss_price,
                     exit_price: fill,
                     fees: p.entry_fees + fees,
                     pnl_rupees: (fill - p.entry_price) * p.lot_size as f64 * p.lots as f64
@@ -535,6 +613,9 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
             entry_time: p.entry_time,
             exit_time: bar.timestamp,
             entry_price: p.entry_price,
+            target_price: p.target_price,
+            stop_loss_price: p.stop_loss_price,
+            trailing_stop_loss_price: p.trailing_stop_loss_price,
             exit_price: exit,
             fees: p.entry_fees + fees,
             pnl_rupees: (exit - p.entry_price) * p.lot_size as f64 * p.lots as f64

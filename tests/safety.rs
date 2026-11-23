@@ -31,7 +31,10 @@ fn setup() -> (Settings, MarketSnapshot, Signal) {
         symbol: "NIFTY".into(),
         side: Side::Buy,
         quantity: 1,
-        limit_price: 100.1,
+        entry_price: 100.1,
+        target_price: 125.0,
+        stop_loss_price: 80.0,
+        trailing_stop_loss_price: 95.0,
         confidence_bps: 7000,
         rationale: "test".into(),
         snapshot_id: Some(snap.id),
@@ -57,7 +60,7 @@ fn duplicate_signal_is_only_journaled_once() {
 fn capital_limit_blocks_trade() {
     let (settings, snap, mut s) = setup();
     s.quantity = 50;
-    s.limit_price = 1000.0;
+    s.entry_price = 1000.0;
     let mut broker = PaperBroker::new(settings.paper);
     assert!(broker
         .execute(&s, &snap.quotes[0], &snap, 0, 0, 15)
