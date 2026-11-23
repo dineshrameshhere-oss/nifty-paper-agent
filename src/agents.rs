@@ -23,7 +23,8 @@ struct Request<'a> {
     model: &'a str,
     messages: [Message<'a>; 2],
     temperature: f32,
-    max_tokens: u32,
+    max_completion_tokens: u32,
+    reasoning_format: &'static str,
     response_format: Format,
 }
 #[derive(Serialize)]
@@ -76,12 +77,15 @@ impl GroqOrchestrator {
         }
         *last = Some(Instant::now());
         drop(last);
+        let system_prompt = format!(
+            "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, limit_price, confidence_bps, rationale, and snapshot_id."
+        );
         let body = Request {
             model,
             messages: [
                 Message {
                     role: "system",
-                    content: system,
+                    content: &system_prompt,
                 },
                 Message {
                     role: "user",
@@ -89,22 +93,25 @@ impl GroqOrchestrator {
                 },
             ],
             temperature: self.config.temperature,
-            max_tokens,
+            max_completion_tokens: max_tokens,
+            reasoning_format: "hidden",
             response_format: Format {
                 kind: "json_object",
             },
         };
-        let response: Response = self
+        let response = self
             .client
             .post(&self.config.base_url)
             .bearer_auth(&self.key)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("decode Groq response")?;
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            bail!("Groq API returned HTTP {status}: {error_body}");
+        }
+        let response: Response = response.json().await.context("decode Groq response")?;
         let json = response
             .choices
             .first()
