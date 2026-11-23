@@ -20,13 +20,14 @@ Install current Termux from a maintained source, then:
 pkg update
 pkg install rust clang make pkg-config openssl
 cd nifty-paper-agent
-cp .env.example .env
-chmod 600 .env
-nano .env
+git pull
+bash scripts/setup-secrets.sh
 nano settings.toml
 cargo test
 cargo run --release
 ```
+
+The setup script prompts for all three secrets without displaying them. To replace just the daily INDstocks token later, run `bash scripts/update-indstocks-token.sh`; it preserves the other `.env` entries.
 
 ## Windows command prompt check
 
@@ -40,7 +41,7 @@ cargo test
 cargo run
 ```
 
-If `rustc` or `cargo` is not recognized, close and reopen Command Prompt after installing Rust so it reloads the updated PATH.
+If `rustc` or `cargo` is not recognized, close and reopen Command Prompt after installing Rust so it reloads the updated PATH. To set the secrets without editing `.env`, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-secrets.ps1`. For a daily token refresh, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-indstocks-token.ps1`.
 
 Put the INDstocks read-only token and Groq key in `.env`, not in source or `settings.toml`. Replace all `SET_GROQ_*_MODEL` values with model IDs currently available to your Groq account. Set `market_data_enabled = true` only after verifying the official INDstocks API version, URL, authentication, quote schema, instrument identifier, WebSocket subscription payload, and rate limits. The current REST scaffold assumes a bearer token and a simple quote JSON object; that assumption is marked for verification and may need adaptation. The WebSocket URL is configuration only: subscription and message decoding remain TODOs until the provider schema is confirmed.
 
