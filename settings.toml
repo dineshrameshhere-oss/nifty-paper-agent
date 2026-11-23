@@ -25,10 +25,10 @@ worker_model = "SET_GROQ_WORKER_MODEL"
 subleader_model = "SET_GROQ_SUBLEADER_MODEL"
 driver_model = "SET_GROQ_DRIVER_MODEL"
 max_concurrent_requests = 10
-requests_per_minute = 30
-max_tokens_worker = 800
-max_tokens_subleader = 900
-max_tokens_driver = 1200
+requests_per_minute = 3
+max_tokens_worker = 400
+max_tokens_subleader = 500
+max_tokens_driver = 600
 temperature = 0.1
 
 [indstocks]
