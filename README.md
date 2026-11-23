@@ -28,6 +28,20 @@ cargo test
 cargo run --release
 ```
 
+## Windows command prompt check
+
+Install Rust with rustup and the Visual Studio C++ Build Tools workload (MSVC linker and Windows SDK). Open the Visual Studio 2022 x64 Native Tools Command Prompt, or initialize the toolchain in Command Prompt with:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+git clone https://github.com/dineshrameshhere-oss/nifty-paper-agent.git
+cd nifty-paper-agent
+cargo test
+cargo run
+```
+
+If `rustc` or `cargo` is not recognized, close and reopen Command Prompt after installing Rust so it reloads the updated PATH.
+
 Put the INDstocks read-only token and Groq key in `.env`, not in source or `settings.toml`. Replace all `SET_GROQ_*_MODEL` values with model IDs currently available to your Groq account. Set `market_data_enabled = true` only after verifying the official INDstocks API version, URL, authentication, quote schema, instrument identifier, WebSocket subscription payload, and rate limits. The current REST scaffold assumes a bearer token and a simple quote JSON object; that assumption is marked for verification and may need adaptation. The WebSocket URL is configuration only: subscription and message decoding remain TODOs until the provider schema is confirmed.
 
 The executable currently validates configuration, opens the SQLite journal and exits safely. This is intentional while the provider-specific schema and your existing strategy adapter are unconfigured. Wire verified data into `HybridScheduler`, call `GroqOrchestrator::analyze` per tick, and route only validated paper signals through `PaperBroker` and `Journal`. The Driver is configured to return an assessment only; it is instructed to keep `signal=null`, so no model output can directly trigger a trade in this starter.

@@ -13,8 +13,8 @@ fn setup() -> (Settings, MarketSnapshot, Signal) {
 
 #[test]
 fn rejects_stale_quote() {
-    let (_,_,mut s)=setup(); s.quotes[0].timestamp=Utc::now()-Duration::seconds(90);
-    assert!(ensure_fresh(&s.quotes[0],15).is_err());
+    let (_,mut snapshot,_)=setup(); snapshot.quotes[0].timestamp=Utc::now()-Duration::seconds(90);
+    assert!(ensure_fresh(&snapshot.quotes[0],15).is_err());
 }
 #[test]
 fn duplicate_signal_is_only_journaled_once() {
