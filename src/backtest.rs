@@ -1,4 +1,4 @@
-use crate::types::{MarketSnapshot, Quote, Side, Signal};
+use crate::types::{MarketSnapshot, Quote, Side, Signal, TradeOutcome};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc, Weekday};
@@ -100,6 +100,10 @@ pub trait BacktestPolicy: Send + Sync {
         snapshot: &MarketSnapshot,
         position: Option<&BacktestPosition>,
     ) -> Result<Option<Signal>>;
+
+    async fn on_trade_closed(&self, _outcome: &TradeOutcome) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl Default for SyntheticConfig {
@@ -450,7 +454,12 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                     let pnl = (fill - p.entry_price) * p.lot_size as f64 * p.lots as f64
                         - p.entry_fees
                         - fees;
-                    trades.push(BacktestTrade {
+                    let exit_reason = if q.low <= protective_stop {
+                        "protective_stop"
+                    } else {
+                        "target_hit"
+                    };
+                    let trade = BacktestTrade {
                         symbol: p.symbol,
                         lots: p.lots,
                         entry_time: p.entry_time,
@@ -462,8 +471,32 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                         exit_price: fill,
                         fees: p.entry_fees + fees,
                         pnl_rupees: pnl,
-                    });
+                    };
+                    let return_bps = if trade.entry_price > 0.0 {
+                        (((fill - trade.entry_price) / trade.entry_price) * 10_000.0).round()
+                            as i32
+                    } else {
+                        0
+                    };
+                    let outcome = TradeOutcome {
+                        trade_id: format!("bt-{}-{}", trade.symbol, trade.exit_time.timestamp()),
+                        symbol: trade.symbol.clone(),
+                        side: Side::Buy,
+                        quantity: trade.lots,
+                        entry_price: trade.entry_price,
+                        exit_price: trade.exit_price,
+                        pnl_rupees: trade.pnl_rupees,
+                        return_bps,
+                        exit_reason: exit_reason.into(),
+                        entry_time: trade.entry_time,
+                        exit_time: trade.exit_time,
+                        situation_summary: format!("Backtest bar spot close={:.2}", bars[i].close),
+                        regime_tags: vec!["nifty".into(), "backtest".into()],
+                        decision_rationale: exit_reason.into(),
+                    };
+                    trades.push(trade);
                     *daily_pnl.entry(bars[i].timestamp.date_naive()).or_default() += pnl;
+                    policy.on_trade_closed(&outcome).await?;
                 } else {
                     p.highest_option_price = p.highest_option_price.max(q.high);
                     p.trailing_stop_loss_price = p
@@ -573,7 +606,10 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                 let fees =
                     fill * p.lot_size as f64 * p.lots as f64 * paper.fee_bps as f64 / 10_000.0;
                 cash += fill * p.lot_size as f64 * p.lots as f64 - fees;
-                trades.push(BacktestTrade {
+                let pnl = (fill - p.entry_price) * p.lot_size as f64 * p.lots as f64
+                    - p.entry_fees
+                    - fees;
+                let trade = BacktestTrade {
                     symbol: p.symbol,
                     lots: p.lots,
                     entry_time: p.entry_time,
@@ -584,12 +620,32 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                     trailing_stop_loss_price: p.trailing_stop_loss_price,
                     exit_price: fill,
                     fees: p.entry_fees + fees,
-                    pnl_rupees: (fill - p.entry_price) * p.lot_size as f64 * p.lots as f64
-                        - p.entry_fees
-                        - fees,
-                });
-                *daily_pnl.entry(next.timestamp.date_naive()).or_default() +=
-                    trades.last().unwrap().pnl_rupees;
+                    pnl_rupees: pnl,
+                };
+                let return_bps = if trade.entry_price > 0.0 {
+                    (((fill - trade.entry_price) / trade.entry_price) * 10_000.0).round() as i32
+                } else {
+                    0
+                };
+                let outcome = TradeOutcome {
+                    trade_id: signal.id.clone(),
+                    symbol: trade.symbol.clone(),
+                    side: Side::Buy,
+                    quantity: trade.lots,
+                    entry_price: trade.entry_price,
+                    exit_price: trade.exit_price,
+                    pnl_rupees: trade.pnl_rupees,
+                    return_bps,
+                    exit_reason: "agent_exit".into(),
+                    entry_time: trade.entry_time,
+                    exit_time: trade.exit_time,
+                    situation_summary: snapshot.context.clone(),
+                    regime_tags: vec!["nifty".into(), "backtest".into()],
+                    decision_rationale: signal.rationale.clone(),
+                };
+                trades.push(trade);
+                *daily_pnl.entry(next.timestamp.date_naive()).or_default() += pnl;
+                policy.on_trade_closed(&outcome).await?;
             }
         }
     }
@@ -607,7 +663,9 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
             .max(0.05);
         let fees = exit * p.lot_size as f64 * p.lots as f64 * paper.fee_bps as f64 / 10_000.0;
         cash += exit * p.lot_size as f64 * p.lots as f64 - fees;
-        trades.push(BacktestTrade {
+        let pnl =
+            (exit - p.entry_price) * p.lot_size as f64 * p.lots as f64 - p.entry_fees - fees;
+        let trade = BacktestTrade {
             symbol: p.symbol,
             lots: p.lots,
             entry_time: p.entry_time,
@@ -618,10 +676,31 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
             trailing_stop_loss_price: p.trailing_stop_loss_price,
             exit_price: exit,
             fees: p.entry_fees + fees,
-            pnl_rupees: (exit - p.entry_price) * p.lot_size as f64 * p.lots as f64
-                - p.entry_fees
-                - fees,
-        });
+            pnl_rupees: pnl,
+        };
+        let return_bps = if trade.entry_price > 0.0 {
+            (((exit - trade.entry_price) / trade.entry_price) * 10_000.0).round() as i32
+        } else {
+            0
+        };
+        let outcome = TradeOutcome {
+            trade_id: format!("bt-eod-{}-{}", trade.symbol, trade.exit_time.timestamp()),
+            symbol: trade.symbol.clone(),
+            side: Side::Buy,
+            quantity: trade.lots,
+            entry_price: trade.entry_price,
+            exit_price: trade.exit_price,
+            pnl_rupees: trade.pnl_rupees,
+            return_bps,
+            exit_reason: "end_of_backtest".into(),
+            entry_time: trade.entry_time,
+            exit_time: trade.exit_time,
+            situation_summary: format!("End of backtest mark-to-market spot={:.2}", bar.close),
+            regime_tags: vec!["nifty".into(), "backtest".into()],
+            decision_rationale: "end_of_backtest".into(),
+        };
+        trades.push(trade);
+        policy.on_trade_closed(&outcome).await?;
     }
     Ok(BacktestReport {
         bars_seen: end_bar_index + 1,

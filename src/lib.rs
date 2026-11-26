@@ -5,6 +5,7 @@ pub mod config;
 pub mod data;
 pub mod journal;
 pub mod paper_broker;
+pub mod paper_runner;
 pub mod risk;
 pub mod strategy;
 pub mod types;

@@ -14,23 +14,24 @@ partial_fill_fraction = 1.0
 mode = "hybrid"
 bar_minutes = 5
 stale_after_seconds = 15
-worker_count = 10
-subleader_count = 2
-driver_count = 1
-worker_timeout_seconds = 25
+max_debate_rounds = 1
+max_risk_discuss_rounds = 1
+reflection_enabled = true
+max_memory_results = 5
+stage_timeout_seconds = 30
 
 [llm]
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-worker_model = "gemini-3.1-flash-lite"
-subleader_model = "gemini-3.1-flash-lite"
-driver_model = "gemini-3.1-flash-lite"
+quick_think_model = "gemini-3.1-flash-lite"
+deep_think_model = "gemini-3.1-flash-lite"
 fallback_model = "gemini-3.5-flash-lite"
 max_concurrent_requests = 10
 requests_per_minute = 5
-max_tokens_worker = 400
-max_tokens_subleader = 500
-max_tokens_driver = 600
+max_tokens_analyst = 500
+max_tokens_debate = 600
+max_tokens_decision = 800
 temperature = 0.2
+use_offline_deterministic = false
 
 [indstocks]
 # TODO: verify current official REST/WebSocket base URLs, auth headers, instrument IDs,

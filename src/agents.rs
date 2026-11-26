@@ -1,9 +1,19 @@
 use crate::{
-    config::Llm,
-    types::{AgentOpinion, MarketSnapshot},
+    backtest::{BacktestPolicy, BacktestPosition},
+    config::{Analysis, Llm, Settings},
+    journal::Journal,
+    risk,
+    types::{
+        AnalystReport, AnalystRole, DebateTurn, InvestDebateState, MarketSnapshot, PipelineTrace,
+        PositionContext, ResearchDecision, RetrievedMemory, RiskAnalystRole, RiskDebateState,
+        RiskVerdict, Side, Signal, TradeOutcome, TradeReflection, TraderProposal,
+    },
 };
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,8 +26,19 @@ use tokio::{
     time::Instant,
 };
 
+#[async_trait]
+pub trait LlmBackend: Send + Sync {
+    async fn complete_json(
+        &self,
+        model: &str,
+        system: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<Value>;
+}
+
 #[derive(Clone)]
-pub struct GeminiOrchestrator {
+pub struct GeminiLlmBackend {
     client: reqwest::Client,
     config: Llm,
     key: String,
@@ -25,39 +46,45 @@ pub struct GeminiOrchestrator {
     last_request: Arc<Mutex<Option<Instant>>>,
     fallback_active: Arc<AtomicBool>,
 }
+
 #[derive(Serialize)]
-struct Request<'a> {
+struct GeminiRequest<'a> {
     model: &'a str,
-    messages: [Message<'a>; 1],
+    messages: [GeminiMessage<'a>; 1],
     temperature: f32,
     max_tokens: u32,
     reasoning_effort: &'static str,
-    response_format: Format,
+    response_format: GeminiFormat,
 }
+
 #[derive(Serialize)]
-struct Message<'a> {
+struct GeminiMessage<'a> {
     role: &'a str,
     content: &'a str,
 }
+
 #[derive(Serialize)]
-struct Format {
+struct GeminiFormat {
     #[serde(rename = "type")]
     kind: &'static str,
 }
+
 #[derive(Deserialize)]
-struct Response {
-    choices: Vec<Choice>,
+struct GeminiResponse {
+    choices: Vec<GeminiChoice>,
 }
+
 #[derive(Deserialize)]
-struct Choice {
-    message: Content,
+struct GeminiChoice {
+    message: GeminiContent,
 }
+
 #[derive(Deserialize)]
-struct Content {
+struct GeminiContent {
     content: String,
 }
 
-impl GeminiOrchestrator {
+impl GeminiLlmBackend {
     pub fn new(config: Llm, key: String) -> Self {
         let permits = config.max_concurrent_requests.max(1);
         Self {
@@ -71,8 +98,8 @@ impl GeminiOrchestrator {
     }
 
     async fn wait_for_request_slot(&self) -> Result<()> {
-        // Simple global spacing limiter: safe under the configured RPM, though it does not burst.
-        let min_gap = Duration::from_secs_f64(60.0 / self.config.requests_per_minute.max(1) as f64);
+        let min_gap =
+            Duration::from_secs_f64(60.0 / self.config.requests_per_minute.max(1) as f64);
         let mut last = self.last_request.lock().await;
         if let Some(at) = *last {
             tokio::time::sleep(min_gap.saturating_sub(at.elapsed())).await;
@@ -80,18 +107,24 @@ impl GeminiOrchestrator {
         *last = Some(Instant::now());
         Ok(())
     }
+}
 
-    async fn complete<T: for<'de> Deserialize<'de>>(
+#[async_trait]
+impl LlmBackend for GeminiLlmBackend {
+    async fn complete_json(
         &self,
         model: &str,
         system: &str,
         prompt: &str,
         max_tokens: u32,
-    ) -> Result<T> {
+    ) -> Result<Value> {
+        if model.starts_with("SET_") || self.config.fallback_model.starts_with("SET_") {
+            bail!("configure Gemini model IDs in settings.toml");
+        }
         let _permit = self.gate.acquire().await?;
         let user_prompt = format!(
-            "{system}\n\nReturn exactly one valid JSON object and no Markdown. Include these fields: objective (string), stance (string), confidence_bps (integer from 0 to 10000), evidence (string), and signal (object or null). If signal is an object, include id, source, symbol, side, quantity, entry_price, target_price, stop_loss_price, trailing_stop_loss_price, confidence_bps, rationale, and snapshot_id. All four prices are option premiums in the same units as the quoted option. The agent must choose them; never calculate or fill in missing plan prices."
-        ) + &format!("\n\nInput and evidence:\n{prompt}");
+            "{system}\n\nReturn exactly one valid JSON object and no Markdown.\n\nInput and evidence:\n{prompt}"
+        );
         let mut retry = 0u32;
         let response = loop {
             self.wait_for_request_slot().await?;
@@ -100,16 +133,16 @@ impl GeminiOrchestrator {
             } else {
                 model
             };
-            let body = Request {
+            let body = GeminiRequest {
                 model: selected_model,
-                messages: [Message {
+                messages: [GeminiMessage {
                     role: "user",
                     content: &user_prompt,
                 }],
                 temperature: self.config.temperature,
                 max_tokens,
                 reasoning_effort: "minimal",
-                response_format: Format {
+                response_format: GeminiFormat {
                     kind: "json_object",
                 },
             };
@@ -123,12 +156,10 @@ impl GeminiOrchestrator {
             if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
                 break response;
             }
-            // Drain the temporary error before retrying. Every attempt, including fallback,
-            // passes through the same RPM gate. Do not retry 429 quota errors.
             let _ = response.bytes().await;
             let is_fallback = selected_model == self.config.fallback_model;
             if is_fallback && retry >= 2 {
-                bail!("Gemini primary and fallback models are unavailable (HTTP 503)")
+                bail!("Gemini primary and fallback models are unavailable (HTTP 503)");
             }
             if !is_fallback && retry >= 2 {
                 if !self.config.fallback_model.is_empty() && self.config.fallback_model != model {
@@ -136,7 +167,7 @@ impl GeminiOrchestrator {
                     retry = 0;
                     continue;
                 }
-                bail!("Gemini model unavailable and no distinct fallback model is configured")
+                bail!("Gemini model unavailable and no distinct fallback model is configured");
             }
             tokio::time::sleep(Duration::from_secs(2u64.pow(retry))).await;
             retry += 1;
@@ -146,125 +177,757 @@ impl GeminiOrchestrator {
             let error_body = response.text().await.unwrap_or_default();
             bail!("Gemini API returned HTTP {status}: {error_body}");
         }
-        let response: Response = response.json().await.context("decode Gemini response")?;
-        let json = response
+        let response: GeminiResponse = response.json().await.context("decode Gemini response")?;
+        let raw_json = response
             .choices
             .first()
             .context("Gemini returned no choices")?
             .message
             .content
             .trim();
-        serde_json::from_str(json).context("parse structured agent response")
-    }
-    async fn analyze_with_driver(
-        &self,
-        snapshot: &MarketSnapshot,
-        driver_instruction: &str,
-    ) -> Result<AgentOpinion> {
-        if self.config.worker_model.starts_with("SET_")
-            || self.config.subleader_model.starts_with("SET_")
-            || self.config.driver_model.starts_with("SET_")
-            || self.config.fallback_model.starts_with("SET_")
-        {
-            bail!("configure Gemini model IDs in settings.toml")
-        }
-        let parts = partition(snapshot);
-        let mut jobs = Vec::new();
-        for (index, part) in parts.into_iter().enumerate() {
-            let this = self.clone();
-            let objective = "Assess the NIFTY market evidence for a paper-trading opportunity. Return objective, stance, confidence_bps (0-10000), evidence, and signal=null. Do not invent prices or trade instructions.";
-            jobs.push(tokio::spawn(async move {
-                this.complete::<AgentOpinion>(
-                    &this.config.worker_model,
-                    objective,
-                    &format!("worker={} partition={}", index + 1, part),
-                    this.config.max_tokens_worker,
-                )
-                .await
-            }));
-        }
-        let mut opinions = Vec::with_capacity(10);
-        for job in jobs {
-            opinions.push(job.await??);
-        }
-        require_complete_cycle(&opinions, 10)?;
-        let a = self
-            .lead(
-                "subleader A: synthesize workers 1-5 without adding claims",
-                &opinions[..5],
-                &self.config.subleader_model,
-                self.config.max_tokens_subleader,
-            )
-            .await?;
-        let b = self
-            .lead(
-                "subleader B: synthesize workers 6-10 without adding claims",
-                &opinions[5..],
-                &self.config.subleader_model,
-                self.config.max_tokens_subleader,
-            )
-            .await?;
-        let final_input = serde_json::json!({"snapshot":snapshot,"subleaders":[a,b]});
-        self.complete(
-            &self.config.driver_model,
-            driver_instruction,
-            &final_input.to_string(),
-            self.config.max_tokens_driver,
-        )
-        .await
-    }
-    pub async fn analyze(&self, snapshot: &MarketSnapshot) -> Result<AgentOpinion> {
-        self.analyze_with_driver(snapshot,"Driver: synthesize both subleaders into one final assessment. Preserve signal=null; the live starter has no autonomous order authorization.").await
-    }
-    pub async fn analyze_backtest(&self, snapshot: &MarketSnapshot) -> Result<AgentOpinion> {
-        self.analyze_with_driver(snapshot,"Driver: make a paper-backtest decision from the historical snapshot. If flat, optionally emit one BUY signal for an exact quoted synthetic NIFTY option symbol; quantity is one lot. The agent alone must select expected entry_price, target_price, stop_loss_price, and initial trailing_stop_loss_price in option-premium units. Set entry_price at or above the current ask to reflect an acceptable expected entry; require 0 < stop_loss_price < trailing_stop_loss_price <= entry_price < target_price. If already holding, only emit SELL to close that same symbol when the agent's plan says to exit, otherwise signal=null. Never short, invent symbols/prices, or use future data. Return all required plan fields on any signal.").await
-    }
-    async fn lead(
-        &self,
-        system: &str,
-        opinions: &[AgentOpinion],
-        model: &str,
-        tokens: u32,
-    ) -> Result<AgentOpinion> {
-        self.complete(model, system, &serde_json::to_string(opinions)?, tokens)
-            .await
+        let cleaned = strip_markdown_fences(raw_json);
+        serde_json::from_str(cleaned).context("parse structured Gemini JSON response")
     }
 }
 
-#[async_trait::async_trait]
-impl crate::backtest::BacktestPolicy for GeminiOrchestrator {
+/// Offline deterministic backend for unit/E2E tests and key-free local paper/backtest runs.
+#[derive(Clone, Debug, Default)]
+pub struct DeterministicLlmBackend;
+
+#[async_trait]
+impl LlmBackend for DeterministicLlmBackend {
+    async fn complete_json(
+        &self,
+        _model: &str,
+        system: &str,
+        prompt: &str,
+        _max_tokens: u32,
+    ) -> Result<Value> {
+        let payload: Value = serde_json::from_str(prompt).unwrap_or_else(|_| json!({}));
+
+        if system.contains("[STAGE:ANALYST_TECHNICAL]") {
+            let snapshot: MarketSnapshot =
+                serde_json::from_value(payload["snapshot"].clone()).context("decode snapshot")?;
+            let (stance, summary, levels) = evaluate_technical(&snapshot);
+            return Ok(serde_json::to_value(AnalystReport {
+                role: AnalystRole::Technical,
+                stance,
+                confidence_bps: 7200,
+                summary,
+                key_levels: levels,
+                evidence: snapshot.context.clone(),
+                regime_tags: vec!["nifty".into(), "intraday_5m".into(), "technical".into()],
+            })?);
+        }
+
+        if system.contains("[STAGE:ANALYST_OPTIONS]") {
+            let snapshot: MarketSnapshot =
+                serde_json::from_value(payload["snapshot"].clone()).context("decode snapshot")?;
+            let best = pick_best_option(&snapshot);
+            let (summary, levels) = match best {
+                Some(q) => (
+                    format!(
+                        "Tightest liquid contract {} bid={:.2} ask={:.2} last={:.2}",
+                        q.symbol, q.bid, q.ask, q.last
+                    ),
+                    vec![format!("{:.2}", q.bid), format!("{:.2}", q.ask)],
+                ),
+                None => ("No liquid option contract available".into(), vec![]),
+            };
+            return Ok(serde_json::to_value(AnalystReport {
+                role: AnalystRole::OptionsVolatility,
+                stance: "bullish".into(),
+                confidence_bps: 7000,
+                summary,
+                key_levels: levels,
+                evidence: "Option chain spread and premium assessment".into(),
+                regime_tags: vec!["options".into(), "volatility".into()],
+            })?);
+        }
+
+        if system.contains("[STAGE:ANALYST_REGIME]") {
+            let snapshot: MarketSnapshot =
+                serde_json::from_value(payload["snapshot"].clone()).context("decode snapshot")?;
+            let mem_count = payload["memories"]
+                .as_array()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            return Ok(serde_json::to_value(AnalystReport {
+                role: AnalystRole::RegimeSentiment,
+                stance: "neutral_bullish".into(),
+                confidence_bps: 6800,
+                summary: format!(
+                    "Regime balanced across {} quotes with {} recalled memories",
+                    snapshot.quotes.len(),
+                    mem_count
+                ),
+                key_levels: vec![],
+                evidence: snapshot.context,
+                regime_tags: vec!["regime".into(), "sentiment".into()],
+            })?);
+        }
+
+        if system.contains("[STAGE:RESEARCH_BULL]") {
+            let round = payload["round"].as_u64().unwrap_or(1) as usize;
+            return Ok(serde_json::to_value(DebateTurn {
+                speaker: "bull_researcher".into(),
+                round,
+                argument: "Bull case: option chain liquidity and momentum support a defined-risk long option entry.".into(),
+                confidence_bps: 7400,
+            })?);
+        }
+
+        if system.contains("[STAGE:RESEARCH_BEAR]") {
+            let round = payload["round"].as_u64().unwrap_or(1) as usize;
+            return Ok(serde_json::to_value(DebateTurn {
+                speaker: "bear_researcher".into(),
+                round,
+                argument: "Bear case: theta decay and bid-ask slippage require strict stop_loss_price and trailing_stop_loss_price discipline.".into(),
+                confidence_bps: 6200,
+            })?);
+        }
+
+        if system.contains("[STAGE:RESEARCH_MANAGER]") {
+            return Ok(serde_json::to_value(ResearchDecision {
+                stance: "bullish".into(),
+                confidence_bps: 7300,
+                thesis: "Synthesized bull momentum with bear risk discipline favors a single-lot defined-risk option trade.".into(),
+                investment_plan: "Enter liquid option with strict stop < trail <= entry < target.".into(),
+                preferred_right: Some("CE".into()),
+                key_risks: vec!["theta_decay".into(), "spread_slippage".into()],
+            })?);
+        }
+
+        if system.contains("[STAGE:TRADER]") {
+            let snapshot: MarketSnapshot =
+                serde_json::from_value(payload["snapshot"].clone()).context("decode snapshot")?;
+            let position: Option<PositionContext> =
+                serde_json::from_value(payload["position"].clone()).ok();
+
+            if let Some(pos) = position {
+                if let Some(q) = snapshot.quotes.iter().find(|q| q.symbol == pos.symbol) {
+                    let should_exit = q.bid >= pos.target_price
+                        || q.bid <= pos.stop_loss_price
+                        || q.bid <= pos.trailing_stop_loss_price;
+                    if should_exit {
+                        let sig = Signal {
+                            id: format!("ta-exit-{}-{}", pos.symbol, snapshot.id),
+                            source: "trading_agents_trader".into(),
+                            symbol: pos.symbol,
+                            side: Side::Sell,
+                            quantity: pos.quantity.max(1),
+                            entry_price: q.bid.max(0.05),
+                            target_price: pos.target_price,
+                            stop_loss_price: pos.stop_loss_price,
+                            trailing_stop_loss_price: pos.trailing_stop_loss_price,
+                            confidence_bps: 7600,
+                            rationale: "Deterministic exit on target/stop threshold".into(),
+                            snapshot_id: Some(snapshot.id),
+                        };
+                        return Ok(serde_json::to_value(TraderProposal {
+                            action: "SELL".into(),
+                            rationale: "Closing existing long position".into(),
+                            confidence_bps: 7600,
+                            signal: Some(sig),
+                        })?);
+                    }
+                }
+                return Ok(serde_json::to_value(TraderProposal {
+                    action: "HOLD".into(),
+                    rationale: "Existing long position remains within target and protective stops"
+                        .into(),
+                    confidence_bps: 7000,
+                    signal: None,
+                })?);
+            }
+
+            if let Some(q) = pick_best_option(&snapshot) {
+                let entry_price = (q.ask * 1.05).max(q.ask + 0.5);
+                let target_price = (entry_price * 1.25).max(entry_price + 2.0);
+                let stop_loss_price = (entry_price * 0.70).max(0.05);
+                let trailing_stop_loss_price = (entry_price * 0.85).max(stop_loss_price + 0.05);
+                let sig = Signal {
+                    id: format!("ta-buy-{}-{}", q.symbol, snapshot.id),
+                    source: "trading_agents_trader".into(),
+                    symbol: q.symbol.clone(),
+                    side: Side::Buy,
+                    quantity: 1,
+                    entry_price,
+                    target_price,
+                    stop_loss_price,
+                    trailing_stop_loss_price,
+                    confidence_bps: 7400,
+                    rationale: format!("Defined-risk long option entry on {}", q.symbol),
+                    snapshot_id: Some(snapshot.id),
+                };
+                return Ok(serde_json::to_value(TraderProposal {
+                    action: "BUY".into(),
+                    rationale: "Proposing 1-lot defined-risk long option".into(),
+                    confidence_bps: 7400,
+                    signal: Some(sig),
+                })?);
+            }
+
+            return Ok(serde_json::to_value(TraderProposal {
+                action: "HOLD".into(),
+                rationale: "No valid quote in snapshot".into(),
+                confidence_bps: 5000,
+                signal: None,
+            })?);
+        }
+
+        if system.contains("[STAGE:RISK_ANALYST]") {
+            let role = payload["role"].as_str().unwrap_or("neutral");
+            let round = payload["round"].as_u64().unwrap_or(1) as usize;
+            return Ok(serde_json::to_value(DebateTurn {
+                speaker: format!("{role}_risk_analyst"),
+                round,
+                argument: format!(
+                    "{role} risk review: verified defined-risk levels and position sizing."
+                ),
+                confidence_bps: 7300,
+            })?);
+        }
+
+        if system.contains("[STAGE:RISK_MANAGER]") {
+            let proposal: TraderProposal =
+                serde_json::from_value(payload["trader_proposal"].clone())
+                    .context("decode trader_proposal")?;
+            let approved = proposal
+                .signal
+                .as_ref()
+                .is_some_and(|s| risk::check_agent_plan(s).is_ok());
+            return Ok(serde_json::to_value(RiskVerdict {
+                approved: approved || proposal.signal.is_none(),
+                decision: if proposal.signal.is_some() {
+                    if approved {
+                        "APPROVE".into()
+                    } else {
+                        "VETO".into()
+                    }
+                } else {
+                    "HOLD".into()
+                },
+                adjusted_confidence_bps: proposal.confidence_bps,
+                verdict_rationale: "Risk Manager validated plan invariants and exposure".into(),
+                final_signal: if approved { proposal.signal } else { None },
+            })?);
+        }
+
+        if system.contains("[STAGE:REFLECTOR]") {
+            let outcome: TradeOutcome =
+                serde_json::from_value(payload["outcome"].clone()).context("decode outcome")?;
+            let outcome_label = if outcome.pnl_rupees >= 0.0 {
+                "profitable"
+            } else {
+                "loss-making"
+            };
+            return Ok(serde_json::to_value(json!({
+                "lesson_bull": format!("Bull thesis on {} yielded {} exit ({})", outcome.symbol, outcome_label, outcome.exit_reason),
+                "lesson_bear": format!("Bear risk check noted exit_reason={} with return {} bps", outcome.exit_reason, outcome.return_bps),
+                "lesson_trader": format!("Entry {:.2} -> Exit {:.2}; calibrate target and trailing stop spacing", outcome.entry_price, outcome.exit_price),
+                "lesson_risk": format!("Position sizing and stop discipline produced PnL {:.2} INR", outcome.pnl_rupees),
+                "lesson_summary": format!("{} trade on {} ({}): PnL {:.2} INR ({} bps)", outcome_label, outcome.symbol, outcome.exit_reason, outcome.pnl_rupees, outcome.return_bps),
+            }))?);
+        }
+
+        bail!("unknown deterministic stage prompt: {system}")
+    }
+}
+
+fn evaluate_technical(snapshot: &MarketSnapshot) -> (String, String, Vec<String>) {
+    if let Some(q) = snapshot.quotes.first() {
+        let spread = (q.ask - q.bid).max(0.0);
+        let stance = if q.last >= (q.bid + q.ask) / 2.0 {
+            "bullish"
+        } else {
+            "neutral"
+        };
+        (
+            stance.into(),
+            format!(
+                "Primary quote {} last={:.2} spread={:.2}",
+                q.symbol, q.last, spread
+            ),
+            vec![format!("{:.2}", q.bid), format!("{:.2}", q.ask)],
+        )
+    } else {
+        ("neutral".into(), "Empty quote list".into(), vec![])
+    }
+}
+
+fn pick_best_option(snapshot: &MarketSnapshot) -> Option<&crate::types::Quote> {
+    snapshot
+        .quotes
+        .iter()
+        .filter(|q| q.bid > 0.0 && q.ask >= q.bid)
+        .min_by(|a, b| {
+            let sa = (a.ask - a.bid) / a.ask.max(1.0);
+            let sb = (b.ask - b.bid) / b.ask.max(1.0);
+            sa.total_cmp(&sb).then_with(|| a.ask.total_cmp(&b.ask))
+        })
+}
+
+#[derive(Clone)]
+pub struct TradingAgentsOrchestrator {
+    analysis: Analysis,
+    llm: Llm,
+    backend: Arc<dyn LlmBackend>,
+    journal: Option<Arc<Journal>>,
+}
+
+impl TradingAgentsOrchestrator {
+    pub fn new(analysis: Analysis, llm: Llm, backend: Arc<dyn LlmBackend>) -> Self {
+        Self {
+            analysis,
+            llm,
+            backend,
+            journal: None,
+        }
+    }
+
+    pub fn gemini(analysis: Analysis, llm: Llm, api_key: String) -> Self {
+        let backend = Arc::new(GeminiLlmBackend::new(llm.clone(), api_key));
+        Self::new(analysis, llm, backend)
+    }
+
+    pub fn deterministic(analysis: Analysis, llm: Llm) -> Self {
+        Self::new(analysis, llm, Arc::new(DeterministicLlmBackend))
+    }
+
+    pub fn from_settings(settings: &Settings) -> Result<Self> {
+        if settings.llm.use_offline_deterministic {
+            return Ok(Self::deterministic(
+                settings.analysis.clone(),
+                settings.llm.clone(),
+            ));
+        }
+        let key = std::env::var("GEMINI_API_KEY").context(
+            "GEMINI_API_KEY not set; configure it or set llm.use_offline_deterministic = true",
+        )?;
+        Ok(Self::gemini(
+            settings.analysis.clone(),
+            settings.llm.clone(),
+            key,
+        ))
+    }
+
+    pub fn with_journal(mut self, journal: Arc<Journal>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    async fn call_stage<T: for<'de> Deserialize<'de>>(
+        &self,
+        model: &str,
+        system: &str,
+        payload: &Value,
+        max_tokens: u32,
+    ) -> Result<T> {
+        let timeout = Duration::from_secs(self.analysis.stage_timeout_seconds.max(1));
+        let prompt = serde_json::to_string(payload)?;
+        let value = tokio::time::timeout(
+            timeout,
+            self.backend.complete_json(model, system, &prompt, max_tokens),
+        )
+        .await
+        .context("TradingAgents stage timed out")??;
+        serde_json::from_value(value).context("decode TradingAgents stage response")
+    }
+
+    pub async fn decide_with_trace(
+        &self,
+        snapshot: &MarketSnapshot,
+        position: Option<&PositionContext>,
+        journal: Option<&Journal>,
+    ) -> Result<PipelineTrace> {
+        let active_journal = journal.or(self.journal.as_deref());
+        let primary_symbol = position
+            .map(|p| p.symbol.as_str())
+            .or_else(|| snapshot.quotes.first().map(|q| q.symbol.as_str()));
+
+        // Stage 0: Reflection memory retrieval
+        let retrieved_memories: Vec<RetrievedMemory> =
+            if self.analysis.reflection_enabled && self.analysis.max_memory_results > 0 {
+                if let Some(j) = active_journal {
+                    let tags = vec!["nifty".to_string(), "options".to_string()];
+                    j.query_reflections(
+                        &snapshot.context,
+                        &tags,
+                        primary_symbol,
+                        self.analysis.max_memory_results,
+                    )?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+        // Stage 1: Analyst Team (3 parallel analysts)
+        let analyst_payload = json!({
+            "snapshot": snapshot,
+            "memories": &retrieved_memories,
+        });
+        let (tech_res, opt_res, reg_res) = tokio::join!(
+            self.call_stage::<AnalystReport>(
+                &self.llm.quick_think_model,
+                "[STAGE:ANALYST_TECHNICAL] You are the Technical Analyst for NIFTY options. Return JSON matching AnalystReport (role=\"technical\", stance, confidence_bps 0-10000, summary, key_levels, evidence, regime_tags).",
+                &analyst_payload,
+                self.llm.max_tokens_analyst,
+            ),
+            self.call_stage::<AnalystReport>(
+                &self.llm.quick_think_model,
+                "[STAGE:ANALYST_OPTIONS] You are the Options & Volatility Analyst for NIFTY. Evaluate IV, expiry, strike, and bid-ask spreads. Return JSON matching AnalystReport (role=\"options_volatility\", stance, confidence_bps, summary, key_levels, evidence, regime_tags).",
+                &analyst_payload,
+                self.llm.max_tokens_analyst,
+            ),
+            self.call_stage::<AnalystReport>(
+                &self.llm.quick_think_model,
+                "[STAGE:ANALYST_REGIME] You are the Regime & Sentiment Analyst for NIFTY. Assess liquidity, macro/event context, and recalled memories. Return JSON matching AnalystReport (role=\"regime_sentiment\", stance, confidence_bps, summary, key_levels, evidence, regime_tags).",
+                &analyst_payload,
+                self.llm.max_tokens_analyst,
+            )
+        );
+        let analyst_reports = vec![tech_res?, opt_res?, reg_res?];
+
+        // Stage 2: Research Team (Bull vs Bear dialectical debate + Research Manager)
+        let debate_rounds = self.analysis.max_debate_rounds.max(1);
+        let mut invest_debate = InvestDebateState::default();
+        for round in 1..=debate_rounds {
+            let bull_payload = json!({
+                "round": round,
+                "analyst_reports": &analyst_reports,
+                "memories": &retrieved_memories,
+                "debate": &invest_debate,
+            });
+            let bull_turn: DebateTurn = self
+                .call_stage(
+                    &self.llm.quick_think_model,
+                    "[STAGE:RESEARCH_BULL] You are the Bull Researcher. Build the strongest bullish case from the analyst reports and memories, countering bear points. Return JSON DebateTurn (speaker, round, argument, confidence_bps).",
+                    &bull_payload,
+                    self.llm.max_tokens_debate,
+                )
+                .await?;
+            invest_debate.bull_history.push(bull_turn.argument.clone());
+            invest_debate.current_response = bull_turn.argument.clone();
+            invest_debate.history.push(bull_turn);
+            invest_debate.count += 1;
+
+            let bear_payload = json!({
+                "round": round,
+                "analyst_reports": &analyst_reports,
+                "memories": &retrieved_memories,
+                "debate": &invest_debate,
+            });
+            let bear_turn: DebateTurn = self
+                .call_stage(
+                    &self.llm.quick_think_model,
+                    "[STAGE:RESEARCH_BEAR] You are the Bear Researcher. Challenge the bull case with downside risks, theta decay, and invalidation scenarios. Return JSON DebateTurn (speaker, round, argument, confidence_bps).",
+                    &bear_payload,
+                    self.llm.max_tokens_debate,
+                )
+                .await?;
+            invest_debate.bear_history.push(bear_turn.argument.clone());
+            invest_debate.current_response = bear_turn.argument.clone();
+            invest_debate.history.push(bear_turn);
+            invest_debate.count += 1;
+        }
+
+        let manager_payload = json!({
+            "analyst_reports": &analyst_reports,
+            "invest_debate": &invest_debate,
+            "memories": &retrieved_memories,
+        });
+        let research_decision: ResearchDecision = self
+            .call_stage(
+                &self.llm.deep_think_model,
+                "[STAGE:RESEARCH_MANAGER] You are the Research Manager. Synthesize the Bull/Bear debate into one disciplined ResearchDecision JSON (stance, confidence_bps, thesis, investment_plan, preferred_right, key_risks).",
+                &manager_payload,
+                self.llm.max_tokens_debate,
+            )
+            .await?;
+
+        // Stage 3: Trader Agent
+        let trader_payload = json!({
+            "snapshot": snapshot,
+            "position": position,
+            "research_decision": &research_decision,
+            "memories": &retrieved_memories,
+        });
+        let trader_proposal: TraderProposal = self
+            .call_stage(
+                &self.llm.deep_think_model,
+                "[STAGE:TRADER] You are the Trader Agent. From research_decision, position, and snapshot, return TraderProposal JSON (action, rationale, confidence_bps, signal). If flat and proposing BUY, select an exact quoted symbol, quantity=1, and agent-selected option-premium entry_price, target_price, stop_loss_price, trailing_stop_loss_price satisfying 0 < stop_loss_price < trailing_stop_loss_price <= entry_price < target_price. If holding, emit SELL only to close that symbol or signal=null to hold. Never short.",
+                &trader_payload,
+                self.llm.max_tokens_decision,
+            )
+            .await?;
+
+        // Stage 4: Risk Management Committee (Aggressive, Conservative, Neutral + Risk Judge)
+        let risk_rounds = self.analysis.max_risk_discuss_rounds.max(1);
+        let mut risk_debate = RiskDebateState::default();
+        for round in 1..=risk_rounds {
+            for role in [
+                RiskAnalystRole::Aggressive,
+                RiskAnalystRole::Conservative,
+                RiskAnalystRole::Neutral,
+            ] {
+                let risk_payload = json!({
+                    "role": role.as_str(),
+                    "round": round,
+                    "trader_proposal": &trader_proposal,
+                    "research_decision": &research_decision,
+                    "risk_debate": &risk_debate,
+                });
+                let turn: DebateTurn = self
+                    .call_stage(
+                        &self.llm.quick_think_model,
+                        "[STAGE:RISK_ANALYST] You are a Risk Analyst on the Risk Management Committee. Critique the trader_proposal from your assigned risk posture. Return JSON DebateTurn (speaker, round, argument, confidence_bps).",
+                        &risk_payload,
+                        self.llm.max_tokens_debate,
+                    )
+                    .await?;
+                match role {
+                    RiskAnalystRole::Aggressive => {
+                        risk_debate.risky_history.push(turn.argument.clone());
+                    }
+                    RiskAnalystRole::Conservative => {
+                        risk_debate.safe_history.push(turn.argument.clone());
+                    }
+                    RiskAnalystRole::Neutral => {
+                        risk_debate.neutral_history.push(turn.argument.clone());
+                    }
+                }
+                risk_debate.latest_speaker = role.as_str().into();
+                risk_debate.history.push(turn);
+                risk_debate.count += 1;
+            }
+        }
+
+        let judge_payload = json!({
+            "snapshot": snapshot,
+            "position": position,
+            "trader_proposal": &trader_proposal,
+            "risk_debate": &risk_debate,
+        });
+        let mut risk_verdict: RiskVerdict = self
+            .call_stage(
+                &self.llm.deep_think_model,
+                "[STAGE:RISK_MANAGER] You are the Risk Manager Judge. Review trader_proposal and risk_debate. Return RiskVerdict JSON (approved, decision, adjusted_confidence_bps, verdict_rationale, final_signal). Veto (approved=false, final_signal=null) if risk/reward or plan levels are unsafe.",
+                &judge_payload,
+                self.llm.max_tokens_decision,
+            )
+            .await?;
+
+        // Deterministic safety enforcement on final_signal
+        if !risk_verdict.approved {
+            risk_verdict.final_signal = None;
+        } else if let Some(ref mut sig) = risk_verdict.final_signal {
+            sig.snapshot_id = Some(snapshot.id);
+            if let Err(err) = risk::check_agent_plan(sig) {
+                risk_verdict.approved = false;
+                risk_verdict.decision = "VETO".into();
+                risk_verdict.verdict_rationale =
+                    format!("Deterministic plan check rejected signal: {err}");
+                risk_verdict.final_signal = None;
+            }
+        }
+
+        let final_signal = risk_verdict.final_signal.clone();
+        let trace = PipelineTrace {
+            snapshot_id: snapshot.id,
+            created_at: snapshot.created_at,
+            retrieved_memories,
+            analyst_reports,
+            invest_debate,
+            research_decision,
+            trader_proposal,
+            risk_debate,
+            risk_verdict,
+            final_signal,
+        };
+
+        if let Some(j) = active_journal {
+            j.record_pipeline_trace(&trace)?;
+        }
+
+        Ok(trace)
+    }
+
+    pub async fn reflect_on_trade(
+        &self,
+        outcome: &TradeOutcome,
+        journal: Option<&Journal>,
+    ) -> Result<TradeReflection> {
+        #[derive(Deserialize)]
+        struct ReflectorOutput {
+            lesson_bull: String,
+            lesson_bear: String,
+            lesson_trader: String,
+            lesson_risk: String,
+            lesson_summary: String,
+        }
+
+        let active_journal = journal.or(self.journal.as_deref());
+        let payload = json!({ "outcome": outcome });
+        let out: ReflectorOutput = self
+            .call_stage(
+                &self.llm.deep_think_model,
+                "[STAGE:REFLECTOR] You are the Post-Trade Reflector. Analyze the completed TradeOutcome and return JSON with lesson_bull, lesson_bear, lesson_trader, lesson_risk, lesson_summary.",
+                &payload,
+                self.llm.max_tokens_debate,
+            )
+            .await?;
+
+        let mut reflection = TradeReflection {
+            id: None,
+            trade_id: outcome.trade_id.clone(),
+            symbol: outcome.symbol.clone(),
+            side: outcome.side,
+            pnl_rupees: outcome.pnl_rupees,
+            return_bps: outcome.return_bps,
+            exit_reason: outcome.exit_reason.clone(),
+            situation_summary: outcome.situation_summary.clone(),
+            regime_tags: outcome.regime_tags.clone(),
+            lesson_summary: out.lesson_summary,
+            lesson_bull: out.lesson_bull,
+            lesson_bear: out.lesson_bear,
+            lesson_trader: out.lesson_trader,
+            lesson_risk: out.lesson_risk,
+            created_at: Utc::now(),
+        };
+
+        if self.analysis.reflection_enabled {
+            if let Some(j) = active_journal {
+                let id = j.record_reflection(&reflection)?;
+                reflection.id = Some(id);
+            }
+        }
+
+        Ok(reflection)
+    }
+}
+
+#[async_trait]
+impl BacktestPolicy for TradingAgentsOrchestrator {
     async fn decide(
         &self,
         snapshot: &MarketSnapshot,
-        _position: Option<&crate::backtest::BacktestPosition>,
-    ) -> Result<Option<crate::types::Signal>> {
-        Ok(self.analyze_backtest(snapshot).await?.signal)
+        position: Option<&BacktestPosition>,
+    ) -> Result<Option<Signal>> {
+        let pos_ctx = position.map(|p| PositionContext {
+            symbol: p.symbol.clone(),
+            quantity: p.lots,
+            entry_price: p.entry_price,
+            target_price: p.target_price,
+            stop_loss_price: p.stop_loss_price,
+            trailing_stop_loss_price: p.trailing_stop_loss_price,
+            unrealized_pnl_rupees: 0.0,
+            entry_time: Some(p.entry_time),
+        });
+        let trace = self
+            .decide_with_trace(snapshot, pos_ctx.as_ref(), self.journal.as_deref())
+            .await?;
+        Ok(trace.final_signal)
+    }
+
+    async fn on_trade_closed(&self, outcome: &TradeOutcome) -> Result<()> {
+        if self.analysis.reflection_enabled {
+            self.reflect_on_trade(outcome, self.journal.as_deref())
+                .await?;
+        }
+        Ok(())
     }
 }
 
-pub fn require_complete_cycle(opinions: &[AgentOpinion], expected: usize) -> Result<()> {
-    if opinions.len() != expected {
-        bail!(
-            "incomplete worker cycle: expected {expected}, got {}",
-            opinions.len()
-        )
+fn strip_markdown_fences(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```json") {
+        rest.trim().strip_suffix("```").unwrap_or(rest).trim()
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest.trim().strip_suffix("```").unwrap_or(rest).trim()
+    } else {
+        trimmed
     }
-    Ok(())
 }
 
-fn partition(snapshot: &MarketSnapshot) -> Vec<String> {
-    let market = serde_json::to_string(snapshot).unwrap_or_default();
-    let lenses = [
-        "price and spread",
-        "short-term momentum",
-        "volatility and range",
-        "volume and liquidity",
-        "support and resistance",
-        "trend context",
-        "risk and invalidation",
-        "data quality",
-        "event sensitivity",
-        "counter-hypothesis",
-    ];
-    lenses.iter().enumerate().map(|(i, lens)| format!("objective=common NIFTY assessment; analytical lens={lens}; evidence partition {} of 10: {market}",i+1)).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Quote;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn sample_snapshot() -> MarketSnapshot {
+        let now = Utc::now();
+        MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: now,
+            quotes: vec![
+                Quote {
+                    symbol: "NIFTY-2026-11-24-25350-CE".into(),
+                    bid: 120.0,
+                    ask: 121.0,
+                    last: 120.5,
+                    timestamp: now,
+                },
+                Quote {
+                    symbol: "NIFTY-2026-11-24-25350-PE".into(),
+                    bid: 115.0,
+                    ask: 117.0,
+                    last: 116.0,
+                    timestamp: now,
+                },
+            ],
+            context: "HISTORICAL NIFTY BAR; spot O/H/L/C=25300/25360/25290/25350; FLAT".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn trading_agents_pipeline_runs_all_five_stages_deterministically() {
+        let orch = TradingAgentsOrchestrator::deterministic(Analysis::default(), Llm::default());
+        let journal = Journal::open(":memory:").unwrap();
+        let snap = sample_snapshot();
+
+        let trace = orch.decide_with_trace(&snap, None, Some(&journal)).await.unwrap();
+        assert_eq!(trace.analyst_reports.len(), 3);
+        assert_eq!(trace.invest_debate.bull_history.len(), 1);
+        assert_eq!(trace.invest_debate.bear_history.len(), 1);
+        assert_eq!(trace.risk_debate.risky_history.len(), 1);
+        assert_eq!(trace.risk_debate.safe_history.len(), 1);
+        assert_eq!(trace.risk_debate.neutral_history.len(), 1);
+        assert!(trace.risk_verdict.approved);
+        let sig = trace.final_signal.expect("expected buy signal");
+        assert_eq!(sig.side, Side::Buy);
+        assert!(risk::check_agent_plan(&sig).is_ok());
+
+        let outcome = TradeOutcome {
+            trade_id: sig.id.clone(),
+            symbol: sig.symbol.clone(),
+            side: Side::Buy,
+            quantity: sig.quantity,
+            entry_price: 121.0,
+            exit_price: 145.0,
+            pnl_rupees: 24.0 * 65.0,
+            return_bps: 1983,
+            exit_reason: "target_hit".into(),
+            entry_time: Utc::now(),
+            exit_time: Utc::now(),
+            situation_summary: snap.context.clone(),
+            regime_tags: vec!["nifty".into(), "options".into()],
+            decision_rationale: sig.rationale.clone(),
+        };
+        let reflection = orch.reflect_on_trade(&outcome, Some(&journal)).await.unwrap();
+        assert!(reflection.id.is_some());
+        assert_eq!(journal.reflection_count().unwrap(), 1);
+
+        // Next decision should recall the persisted reflection memory
+        let snap2 = sample_snapshot();
+        let trace2 = orch
+            .decide_with_trace(&snap2, None, Some(&journal))
+            .await
+            .unwrap();
+        assert_eq!(trace2.retrieved_memories.len(), 1);
+    }
 }

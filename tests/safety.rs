@@ -1,11 +1,12 @@
 use chrono::{Duration, Utc};
 use nifty_paper_agent::{
-    agents::require_complete_cycle,
     config::Settings,
     data::ensure_fresh,
     journal::Journal,
     paper_broker::PaperBroker,
-    types::{AgentOpinion, MarketSnapshot, Quote, Side, Signal},
+    risk::check_agent_plan,
+    types::{MarketSnapshot, Quote, Side, Signal},
+    LIVE_ORDER_PLACEMENT_IMPLEMENTED,
 };
 use uuid::Uuid;
 
@@ -43,11 +44,17 @@ fn setup() -> (Settings, MarketSnapshot, Signal) {
 }
 
 #[test]
+fn live_order_placement_remains_disabled() {
+    assert!(!LIVE_ORDER_PLACEMENT_IMPLEMENTED);
+}
+
+#[test]
 fn rejects_stale_quote() {
     let (_, mut snapshot, _) = setup();
     snapshot.quotes[0].timestamp = Utc::now() - Duration::seconds(90);
     assert!(ensure_fresh(&snapshot.quotes[0], 15).is_err());
 }
+
 #[test]
 fn duplicate_signal_is_only_journaled_once() {
     let (_, _, s) = setup();
@@ -56,6 +63,7 @@ fn duplicate_signal_is_only_journaled_once() {
     assert!(j.record_signal(&s).unwrap());
     assert!(!j.record_signal(&s).unwrap());
 }
+
 #[test]
 fn capital_limit_blocks_trade() {
     let (settings, snap, mut s) = setup();
@@ -66,16 +74,10 @@ fn capital_limit_blocks_trade() {
         .execute(&s, &snap.quotes[0], &snap, 0, 0, 15)
         .is_err());
 }
+
 #[test]
-fn incomplete_worker_cycle_is_not_accepted() {
-    let opinions: Vec<AgentOpinion> = (0..9)
-        .map(|_| AgentOpinion {
-            objective: "same".into(),
-            stance: "neutral".into(),
-            confidence_bps: 0,
-            evidence: String::new(),
-            signal: None,
-        })
-        .collect();
-    assert!(require_complete_cycle(&opinions, 10).is_err());
+fn out_of_policy_agent_plan_levels_rejected() {
+    let (_, _, mut s) = setup();
+    s.stop_loss_price = 110.0; // invalid: stop > entry
+    assert!(check_agent_plan(&s).is_err());
 }
