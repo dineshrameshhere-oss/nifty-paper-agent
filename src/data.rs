@@ -126,8 +126,8 @@ impl IndstocksClient {
     pub fn new(config: Indstocks, token: String) -> Self {
         Self {
             http: Self::build_http_client(
-                std::time::Duration::from_secs(10),
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(30),
             ),
             config,
             token,
@@ -177,7 +177,25 @@ impl IndstocksClient {
         let resp = req
             .send()
             .await
-            .with_context(|| format!("send INDstocks {endpoint} request"))?;
+            .map_err(|e| {
+                // Surface the root cause (timeout / DNS / TLS / refused) verbosely in the log.
+                let kind = if e.is_timeout() {
+                    "timeout"
+                } else if e.is_connect() {
+                    "connection-refused/DNS"
+                } else if e.is_request() {
+                    "bad-request-build"
+                } else {
+                    "transport"
+                };
+                warn!(
+                    endpoint = %endpoint,
+                    kind = %kind,
+                    detail = %e,
+                    "INDstocks HTTP send failed"
+                );
+                anyhow::anyhow!("send INDstocks {endpoint} request: [{kind}] {e}")
+            })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         let parsed_body: Option<Value> = serde_json::from_str(&body).ok();
