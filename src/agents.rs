@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -763,6 +763,15 @@ impl TradingAgentsOrchestrator {
         outcome: &TradeOutcome,
         journal: Option<&Journal>,
     ) -> Result<TradeReflection> {
+        self.reflect_on_trade_at(outcome, journal, Utc::now()).await
+    }
+
+    pub async fn reflect_on_trade_at(
+        &self,
+        outcome: &TradeOutcome,
+        journal: Option<&Journal>,
+        now: DateTime<Utc>,
+    ) -> Result<TradeReflection> {
         #[derive(Deserialize)]
         struct ReflectorOutput {
             lesson_bull: String,
@@ -798,7 +807,7 @@ impl TradingAgentsOrchestrator {
             lesson_bear: out.lesson_bear,
             lesson_trader: out.lesson_trader,
             lesson_risk: out.lesson_risk,
-            created_at: Utc::now(),
+            created_at: now,
         };
 
         if self.analysis.reflection_enabled {
@@ -837,7 +846,7 @@ impl BacktestPolicy for TradingAgentsOrchestrator {
 
     async fn on_trade_closed(&self, outcome: &TradeOutcome) -> Result<()> {
         if self.analysis.reflection_enabled {
-            self.reflect_on_trade(outcome, self.journal.as_deref())
+            self.reflect_on_trade_at(outcome, self.journal.as_deref(), outcome.exit_time)
                 .await?;
         }
         Ok(())
@@ -1204,5 +1213,37 @@ mod tests {
         assert_eq!(sig_min.source, "trading_agents_trader");
         assert_eq!(sig_min.confidence_bps, 6000);
         assert_eq!(sig_min.rationale, "Range trade");
+    }
+
+    #[tokio::test]
+    async fn reflect_on_trade_at_stamps_injected_timestamp() {
+        use chrono::TimeZone;
+        let orch = TradingAgentsOrchestrator::deterministic(Analysis::default(), Llm::default());
+        let journal = Journal::open(":memory:").unwrap();
+        let sim_now = Utc.with_ymd_and_hms(2025, 2, 3, 9, 45, 0).unwrap();
+        let outcome = TradeOutcome {
+            trade_id: "sim-trade-1".into(),
+            symbol: "NIFTY-25000-CE".into(),
+            side: Side::Buy,
+            quantity: 10,
+            entry_price: 100.0,
+            exit_price: 120.0,
+            pnl_rupees: 200.0,
+            return_bps: 2000,
+            exit_reason: "target_hit".into(),
+            entry_time: sim_now - chrono::Duration::minutes(10),
+            exit_time: sim_now,
+            situation_summary: "simulated".into(),
+            regime_tags: vec!["nifty".into()],
+            decision_rationale: "test".into(),
+        };
+        let reflection = orch
+            .reflect_on_trade_at(&outcome, Some(&journal), sim_now)
+            .await
+            .unwrap();
+        assert_eq!(reflection.created_at, sim_now);
+        let stored = journal.recent_reflections(1).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].created_at, sim_now);
     }
 }

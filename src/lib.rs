@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod analysis;
 pub mod backtest;
+pub mod clock;
 pub mod config;
 pub mod data;
 pub mod journal;

@@ -123,18 +123,28 @@ pub fn check_agent_plan(signal: &Signal) -> Result<()> {
     Ok(())
 }
 
-pub fn check_market_snapshot(snapshot: &MarketSnapshot, stale_after_seconds: i64) -> Result<()> {
-    let now = chrono::Utc::now();
+pub fn check_market_snapshot_at(
+    snapshot: &MarketSnapshot,
+    stale_after_seconds: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
     if snapshot.quotes.is_empty() {
         bail!("empty snapshot")
+    }
+    if snapshot.created_at > now + chrono::Duration::seconds(5) {
+        bail!("snapshot timestamp is in the future")
     }
     if now - snapshot.created_at > chrono::Duration::seconds(stale_after_seconds) {
         bail!("stale snapshot")
     }
     for quote in &snapshot.quotes {
-        crate::data::ensure_fresh(quote, stale_after_seconds)?;
+        crate::data::ensure_fresh_at(quote, stale_after_seconds, now)?;
     }
     Ok(())
+}
+
+pub fn check_market_snapshot(snapshot: &MarketSnapshot, stale_after_seconds: i64) -> Result<()> {
+    check_market_snapshot_at(snapshot, stale_after_seconds, chrono::Utc::now())
 }
 
 pub(crate) fn exceeds_i64(val: f64, limit: i64) -> bool {
@@ -614,5 +624,87 @@ mod tests {
         let err = check_signal_with_open_qty(&frac_sig, &quote, &frac_paper, 10_000, 0, 0, 0)
             .unwrap_err();
         assert!(err.to_string().contains("insufficient paper capital"));
+    }
+
+    #[test]
+    fn check_market_snapshot_at_validates_against_injected_now() {
+        use chrono::TimeZone;
+        let sim_now = Utc.with_ymd_and_hms(2026, 11, 27, 4, 0, 0).unwrap();
+
+        let fresh_quote = Quote {
+            symbol: "NIFTY-25000-CE".into(),
+            bid: 100.0,
+            ask: 101.0,
+            last: 100.5,
+            timestamp: sim_now - Duration::seconds(15),
+        };
+        let fresh_snap = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now - Duration::seconds(15),
+            quotes: vec![fresh_quote.clone()],
+            context: String::new(),
+        };
+        assert!(check_market_snapshot_at(&fresh_snap, 15, sim_now).is_ok());
+
+        // Stale snapshot relative to sim_now
+        let stale_snap = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now - Duration::seconds(16),
+            quotes: vec![fresh_quote.clone()],
+            context: String::new(),
+        };
+        assert!(check_market_snapshot_at(&stale_snap, 15, sim_now)
+            .unwrap_err()
+            .to_string()
+            .contains("stale snapshot"));
+
+        // Future snapshot > 5s ahead of sim_now
+        let future_snap = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now + Duration::seconds(6),
+            quotes: vec![fresh_quote.clone()],
+            context: String::new(),
+        };
+        assert!(check_market_snapshot_at(&future_snap, 15, sim_now)
+            .unwrap_err()
+            .to_string()
+            .contains("future"));
+
+        // Exactly +5s skew allowed when quote is also within +5s
+        let mut skew_quote = fresh_quote;
+        skew_quote.timestamp = sim_now + Duration::seconds(5);
+        let skew_snap = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now + Duration::seconds(5),
+            quotes: vec![skew_quote],
+            context: String::new(),
+        };
+        assert!(check_market_snapshot_at(&skew_snap, 15, sim_now).is_ok());
+
+        // Fresh snapshot containing a stale quote relative to sim_now
+        let mut stale_quote = sample_quote();
+        stale_quote.timestamp = sim_now - Duration::seconds(20);
+        let mixed_snap = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now,
+            quotes: vec![stale_quote],
+            context: String::new(),
+        };
+        assert!(check_market_snapshot_at(&mixed_snap, 15, sim_now)
+            .unwrap_err()
+            .to_string()
+            .contains("stale market data"));
+
+        // Empty snapshot rejected
+        let empty = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now,
+            quotes: vec![],
+            context: String::new(),
+        };
+        assert!(check_market_snapshot_at(&empty, 15, sim_now)
+            .unwrap_err()
+            .to_string()
+            .contains("empty snapshot"));
     }
 }

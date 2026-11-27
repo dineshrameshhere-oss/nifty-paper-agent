@@ -4,7 +4,7 @@ use crate::{
     types::{Fill, MarketSnapshot, Quote, Side, Signal},
 };
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
@@ -36,6 +36,14 @@ impl PaperBroker {
         self.positions.len()
     }
 
+    pub fn open_symbols(&self) -> Vec<String> {
+        self.positions.keys().cloned().collect()
+    }
+
+    pub fn open_positions(&self) -> Vec<(String, u32)> {
+        self.positions.iter().map(|(k, &v)| (k.clone(), v)).collect()
+    }
+
     pub fn avg_entry_price(&self, symbol: &str) -> Option<f64> {
         self.avg_entry_prices.get(symbol).copied()
     }
@@ -44,6 +52,7 @@ impl PaperBroker {
         self.realized_pnl_paise
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &mut self,
         signal: &Signal,
@@ -53,8 +62,30 @@ impl PaperBroker {
         daily_loss_paise: i64,
         stale_after_seconds: i64,
     ) -> Result<Fill> {
-        risk::check_market_snapshot(snapshot, stale_after_seconds)?;
-        crate::data::ensure_fresh(quote, stale_after_seconds)?;
+        self.execute_at(
+            signal,
+            quote,
+            snapshot,
+            open_positions,
+            daily_loss_paise,
+            stale_after_seconds,
+            Utc::now(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_at(
+        &mut self,
+        signal: &Signal,
+        quote: &Quote,
+        snapshot: &MarketSnapshot,
+        open_positions: usize,
+        daily_loss_paise: i64,
+        stale_after_seconds: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Fill> {
+        risk::check_market_snapshot_at(snapshot, stale_after_seconds, now)?;
+        crate::data::ensure_fresh_at(quote, stale_after_seconds, now)?;
         if signal.snapshot_id.is_some_and(|id| id != snapshot.id) {
             bail!("signal snapshot mismatch")
         }
@@ -126,7 +157,7 @@ impl PaperBroker {
             quantity,
             price: px,
             fees,
-            timestamp: Utc::now(),
+            timestamp: now,
         };
         if signal.side == Side::Buy {
             let gross_paise = checked_rounded_i64(gross, "simulated execution cash overflow")?;
@@ -681,5 +712,45 @@ mod tests {
         assert_eq!(broker.open_position_qty("SYM-ZC"), 1 << 31);
         assert_eq!(broker.avg_entry_price("SYM-ZC"), avg_before);
         assert_eq!(broker.realized_pnl_paise(), 0);
+    }
+
+    #[test]
+    fn execute_at_uses_injected_clock_and_tracks_open_positions() {
+        use chrono::TimeZone;
+        let sim_now = Utc.with_ymd_and_hms(2025, 1, 15, 4, 0, 0).unwrap();
+        let paper = sample_paper();
+        let mut broker = PaperBroker::new(paper);
+
+        let q = Quote {
+            symbol: "NIFTY-25000-CE".into(),
+            bid: 100.0,
+            ask: 100.5,
+            last: 100.25,
+            timestamp: sim_now,
+        };
+        let snap = MarketSnapshot {
+            id: Uuid::new_v4(),
+            created_at: sim_now,
+            quotes: vec![q.clone()],
+            context: String::new(),
+        };
+        let buy = buy_signal("b_sim", "NIFTY-25000-CE", 3, 102.0, Some(snap.id));
+        let fill = broker
+            .execute_at(&buy, &q, &snap, 0, 0, 15, sim_now)
+            .unwrap();
+        assert_eq!(fill.timestamp, sim_now);
+        assert_eq!(broker.open_symbols(), vec!["NIFTY-25000-CE".to_string()]);
+        assert_eq!(
+            broker.open_positions(),
+            vec![("NIFTY-25000-CE".to_string(), 3)]
+        );
+
+        // Stale quote relative to sim_now + 20s rejected
+        let later = sim_now + Duration::seconds(20);
+        let buy2 = buy_signal("b_stale", "NIFTY-25000-CE", 1, 102.0, Some(snap.id));
+        let err = broker
+            .execute_at(&buy2, &q, &snap, 1, 0, 15, later)
+            .unwrap_err();
+        assert!(err.to_string().contains("stale"));
     }
 }

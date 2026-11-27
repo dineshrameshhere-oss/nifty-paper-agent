@@ -1,17 +1,18 @@
 # NIFTY agentic paper trader (Rust / Termux)
 
-Paper-only starter for NIFTY research. It starts with ₹10,000 of simulated capital and has no broker order-placement code. Live order APIs are deliberately absent. The `IndependentStrategy` adapter has no webhook path and defaults to a no-op until you connect your existing strategy implementation.
+Paper-only NIFTY options trading agent in Rust. It starts with ₹10,000 of simulated capital and places **zero live orders** (`LIVE_ORDER_PLACEMENT_IMPLEMENTED = false` in `src/lib.rs`, enforced by `tests/safety.rs`). Live order, portfolio, and margin APIs are deliberately unimplemented in Rust; see [docs/indstocks-api.md](docs/indstocks-api.md) for the authoritative INDmoney / INDstocks v1 API reference covering both read-only market data and post-trial live-trading documentation. The `IndependentStrategy` adapter has no webhook path and defaults to a no-op until you connect your existing strategy implementation.
 
 ## What is included
 
 - Hybrid scheduling primitives: market-data events plus five-minute context ticks.
 - Gemini structured JSON client using `gemini-3.1-flash-lite` at minimal reasoning effort, with a 10 worker → 2 subleader → 1 Driver hierarchy. Workers share one objective and receive distinct analytical lenses; response rate and concurrent calls are bounded in settings.
-- Read-only INDstocks REST adapter scaffold, raw WebSocket URL configuration and explicit endpoint/auth/schema TODOs. No requests are sent until enabled.
+- Read-only INDstocks REST market-data configuration targeting `https://api.indstocks.com` (raw `Authorization: <INDSTOCKS_ACCESS_TOKEN>` header with **no** `Bearer` prefix, NIFTY expiries, option chain spot/Greeks, and quotes; see [docs/indstocks-api.md](docs/indstocks-api.md)). WebSocket price streaming (`wss://ws-prices.indstocks.com/api/v1/ws/prices`) is optional/documented, and zero live order endpoints exist in Rust.
+- Continuous NSE market-hours paper trading workflow (`09:15–15:30 IST`), deterministic tick-level `stop_loss_price`, `trailing_stop_loss_price`, and `target_price` monitoring, and `15:30 IST` end-of-day square-off with a daily P&L/trades summary (target M2/M3 runtime behavior; live `api.indstocks.com` runs require a valid daily token and live smoke verification).
 - Deterministic freshness, position, per-trade capital, daily-loss and short-selling gates.
 - SQLite signal/fill journal with duplicate signal IDs ignored.
 - Paper broker applies configured spread, slippage, fees and partial fills.
 - The agent supplies each entry price, target, initial stop loss and initial trailing stop in option-premium units. Rust only rejects malformed plans, enforces capital and safety limits, and simulates those agent-selected exits; the trailing stop ratchets using the gap selected by the agent.
-- Safety tests for stale data, duplicate signals, capital limits and incomplete worker cycles.
+- Safety tests for `LIVE_ORDER_PLACEMENT_IMPLEMENTED = false`, stale data, duplicate signals, capital limits and incomplete worker cycles.
 - An opt-in LLM backtest that builds a synthetic weekly NIFTY option chain from historical spot bars and fills decisions at the next bar's open.
 
 ## Termux setup
@@ -60,19 +61,49 @@ cargo run
 
 If `rustc` or `cargo` is not recognized, close and reopen Command Prompt after installing Rust so it reloads the updated PATH. To set the secrets without editing `.env`, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-secrets.ps1`. For a daily token refresh, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-indstocks-token.ps1`.
 
-Put the INDstocks read-only token and Gemini API key in `.env`, not in source or `settings.toml`. The LLM uses Google's OpenAI-compatible endpoint and model IDs are configured in `[llm]`; the default model is Gemini 3.1 Flash-Lite with minimal reasoning effort. To update the Gemini key on Windows, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-gemini-key.ps1`. Set `market_data_enabled = true` only after verifying the official INDstocks API version, URL, authentication, quote schema, instrument identifier, WebSocket subscription payload, and rate limits. The current REST scaffold assumes a bearer token and a simple quote JSON object; that assumption is marked for verification and may need adaptation. The WebSocket URL is configuration only: subscription and message decoding remain TODOs until the provider schema is confirmed.
+Put the INDstocks access token and Gemini API key in `.env`, not in source or `settings.toml`. The LLM uses Google's OpenAI-compatible endpoint and model IDs are configured in `[llm]`; the default model is Gemini 3.1 Flash-Lite with minimal reasoning effort. To update the Gemini key on Windows, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-gemini-key.ps1`.
 
-The normal executable currently validates configuration, opens the SQLite journal and exits safely. This is intentional while the provider-specific schema and your existing strategy adapter are unconfigured. The separate `backtest` command replays supplied historical index bars, asks the configured Gemini worker hierarchy for paper decisions, and simulates synthetic option fills. Live order placement remains absent.
+INDstocks v1 authentication requires the **raw** token in `Authorization: <INDSTOCKS_ACCESS_TOKEN>` (**no** `Bearer` prefix), tokens expire after **24 hours**, and read-only market-data requests do **not** require static IP whitelisting (see [docs/indstocks-api.md](docs/indstocks-api.md)). WebSocket streaming (`wss://ws-prices.indstocks.com/api/v1/ws/prices`) remains optional/configuration-only until live token verification.
+
+## 2-Week Live-Data Paper Trading Workflow
+
+All paper-trading modes enforce `LIVE_ORDER_PLACEMENT_IMPLEMENTED = false` (`src/lib.rs`, tested in `tests/safety.rs`), so **zero live broker orders are placed**.
+
+### CLI Commands
+
+- `cargo run --release` — validates `settings.toml`, opens `data/paper.sqlite`, verifies `LIVE_ORDER_PLACEMENT_IMPLEMENTED == false`, and exits safely without network calls.
+- `cargo run --release -- paper --demo` — runs a single synthetic paper step (`NIFTY-DEMO-CE`) without calling INDstocks.
+- `cargo run --release -- paper` (add `--offline` to use deterministic offline decisions without consuming Gemini quota) — runs the live-data paper-trading session against INDstocks market data (`settings.toml` `[indstocks]`).
+- `cargo run --release -- backtest --max-decisions 1` — runs the synthetic historical options backtest.
+
+### Daily Trial Loop (09:15–15:30 IST)
+
+1. **Pre-market token refresh (before `09:15 IST` each trading day)**:
+   - Log in to `https://indstocks.com/app/api-trading/access-tokens` and generate a fresh 24-hour token.
+   - Update `.env` while keeping `GEMINI_API_KEY` and other entries intact:
+     - **Termux**: `bash scripts/update-indstocks-token.sh`
+     - **Windows**: `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\update-indstocks-token.ps1`
+2. **Start the paper session**:
+   - Run `cargo run --release -- paper` (or `cargo run --release -- paper --offline` to test without LLM calls).
+   - During NSE market hours (`09:15–15:30 IST`), the target M2/M3 session loop polls live INDstocks NIFTY spot & option-chain/quote data, evaluates `stop_loss_price`, `trailing_stop_loss_price`, and `target_price` deterministically on incoming ticks, and runs the agent analysis on the configured cadence (`bar_minutes = 5`). *(Note: live calls to `api.indstocks.com` require a valid daily token and have not been live-executed in this repository without user credentials; continuous session orchestration requires M2/M3 completion.)*
+3. **End-of-day auto-stop & daily summary (`15:30 IST`)**:
+   - At or after `15:30 IST`, open paper positions are squared off at the closing price, a daily summary (realized P&L and trades executed details) is printed, and the process exits cleanly so you can refresh `INDSTOCKS_ACCESS_TOKEN` before the next trading day.
 
 ## Configuration and safety
 
-`settings.toml` stores the ₹10,000 starting capital as 1,000,000 paise. Review all risk limits before running. This is a software starter, not a profitable strategy or a guarantee of fill realism. The paper broker approximates costs; it does not model exchange queues, taxes in full, option contract specifications, market impact, or outages. Current quote validation and the scaffold do not yet implement full NIFTY option-chain/five-minute candle normalization.
+`settings.toml` stores the ₹10,000 starting capital as 1,000,000 paise and configures `[indstocks]` (`https://api.indstocks.com`, `/market/instruments/expiries`, `/market/option-chain` with `exchange = "NSE"`, `segment = "INDEX"`, `underlying_scrip = "40000001"`, `/market/quotes/full`). Review all `[paper]` risk limits before running. This is a software starter, not a profitable strategy or a guarantee of fill realism: the paper broker approximates spread, slippage, and fees, and does not model exchange queues, full taxes, market impact, or outages.
 
-Keep `.env`, `data/paper.sqlite`, logs, and backups private. Rotate credentials if exposed. Use read-only market-data credentials. Never paste access tokens into logs, issue trackers, or source control. Android may suspend Termux in the background; disable battery optimization only if you need a continuous paper session, and expect disconnects. Resume by checking data freshness; stale input must not be traded.
+Keep `.env`, `data/paper.sqlite`, logs, and backups private. Rotate credentials if exposed and never paste access tokens into logs, issue trackers, or source control. Android may suspend Termux in the background; disable battery optimization if you run a continuous `09:15–15:30 IST` paper session on-device, and expect disconnects. Resume by checking data freshness; stale input must not be traded.
 
-## Azure static-IP migration (future)
+## Post-Trial Live Readiness & Static-IP Migration (Future)
 
-Do not migrate for current paper testing. When you later move a reviewed paper system to an Azure VM, pin a stable outbound public IP if the provider requires allowlisting, keep market data and strategy credentials in a secret store, restrict inbound firewall access, add health monitoring and restart handling, and test reconnects. Static IP availability and cost depend on the current Azure plan/region. This repository still contains no live order API, so migration does not enable live trading.
+Do **not** migrate to a static-IP VM for the 2-week paper-trading trial: INDstocks read-only market-data APIs do not require static IP whitelisting. Static IP whitelisting (`NSE/INVG/67858`, Primary/Secondary IPv4 or IPv6, max 1 change per calendar week) is required only if you later enable live order placement.
+
+Before any post-trial transition to live trading, review the full live API contracts and readiness checklist in [docs/indstocks-api.md](docs/indstocks-api.md) — in particular:
+- `LIVE_ORDER_PLACEMENT_IMPLEMENTED` remains `false` in `src/lib.rs` (zero live order/account Rust code exists in this repository).
+- INDstocks' smart-order `is_tsl` / `tsl_step_size` fields are **not yet live** (silently ignored), so client-side trailing stop-loss management remains required.
+- Live order/margin endpoints include non-standard quirks (`GET /order`, `GET /order/trades`, and `GET /margin` use `GET` with JSON bodies; `GET /order` returns HTTP `512` on missing orders; no dedicated `/positions/exit` endpoint exists).
+- Static IP availability and cost on an Azure VM (or similar host) depend on the plan/region; keep credentials in a secret store, restrict inbound firewall access, and test reconnects before any live deployment.
 
 ## Android / Termux limits
 

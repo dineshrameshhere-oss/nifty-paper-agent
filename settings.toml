@@ -34,10 +34,15 @@ temperature = 0.2
 use_offline_deterministic = false
 
 [indstocks]
-# TODO: verify current official REST/WebSocket base URLs, auth headers, instrument IDs,
-# response fields and subscription message against your INDstocks API version.
-rest_base_url = "https://REPLACE_WITH_VERIFIED_INDSTOCKS_REST_HOST"
-websocket_url = "wss://REPLACE_WITH_VERIFIED_INDSTOCKS_WEBSOCKET_HOST"
-quote_path = "/REPLACE_WITH_VERIFIED_QUOTE_PATH"
-market_data_enabled = false
+rest_base_url = "https://api.indstocks.com"
+websocket_url = "wss://ws-prices.indstocks.com/api/v1/ws/prices"
+quote_path = "/market/quotes/full"
+option_chain_path = "/market/option-chain"
+expiries_path = "/market/instruments/expiries"
+exchange = "NSE"
+segment = "INDEX"
+underlying_scrip = "40000001"
+strike_count = 10
+poll_interval_seconds = 5
+market_data_enabled = true
 symbol = "NIFTY"

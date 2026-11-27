@@ -118,6 +118,22 @@ pub struct Indstocks {
     pub rest_base_url: String,
     pub websocket_url: String,
     pub quote_path: String,
+    #[serde(default = "default_option_chain_path")]
+    pub option_chain_path: String,
+    #[serde(default = "default_expiries_path")]
+    pub expiries_path: String,
+    #[serde(default = "default_exchange")]
+    pub exchange: String,
+    #[serde(default = "default_segment")]
+    pub segment: String,
+    #[serde(default = "default_underlying_scrip")]
+    pub underlying_scrip: String,
+    #[serde(default = "default_strike_count")]
+    pub strike_count: u32,
+    #[serde(default = "default_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    #[serde(default)]
+    pub expiry_override: Option<String>,
     pub market_data_enabled: bool,
     pub symbol: String,
 }
@@ -125,9 +141,17 @@ pub struct Indstocks {
 impl Default for Indstocks {
     fn default() -> Self {
         Self {
-            rest_base_url: "https://REPLACE_WITH_VERIFIED_INDSTOCKS_REST_HOST".into(),
-            websocket_url: "wss://REPLACE_WITH_VERIFIED_INDSTOCKS_WEBSOCKET_HOST".into(),
-            quote_path: "/REPLACE_WITH_VERIFIED_QUOTE_PATH".into(),
+            rest_base_url: "https://api.indstocks.com".into(),
+            websocket_url: "wss://ws-prices.indstocks.com/api/v1/ws/prices".into(),
+            quote_path: "/market/quotes/full".into(),
+            option_chain_path: default_option_chain_path(),
+            expiries_path: default_expiries_path(),
+            exchange: default_exchange(),
+            segment: default_segment(),
+            underlying_scrip: default_underlying_scrip(),
+            strike_count: default_strike_count(),
+            poll_interval_seconds: default_poll_interval_seconds(),
+            expiry_override: None,
             market_data_enabled: false,
             symbol: "NIFTY".into(),
         }
@@ -164,6 +188,27 @@ fn default_tokens_debate() -> u32 {
 }
 fn default_tokens_decision() -> u32 {
     800
+}
+fn default_option_chain_path() -> String {
+    "/market/option-chain".into()
+}
+fn default_expiries_path() -> String {
+    "/market/instruments/expiries".into()
+}
+fn default_exchange() -> String {
+    "NSE".into()
+}
+fn default_segment() -> String {
+    "INDEX".into()
+}
+fn default_underlying_scrip() -> String {
+    "40000001".into()
+}
+fn default_strike_count() -> u32 {
+    10
+}
+fn default_poll_interval_seconds() -> u64 {
+    5
 }
 
 #[cfg(test)]
@@ -246,6 +291,15 @@ symbol = "NIFTY"
         assert_eq!(s.llm.max_tokens_debate, 600);
         assert_eq!(s.llm.max_tokens_decision, 800);
         assert!(!s.llm.use_offline_deterministic);
+
+        assert_eq!(s.indstocks.option_chain_path, "/market/option-chain");
+        assert_eq!(s.indstocks.expiries_path, "/market/instruments/expiries");
+        assert_eq!(s.indstocks.exchange, "NSE");
+        assert_eq!(s.indstocks.segment, "INDEX");
+        assert_eq!(s.indstocks.underlying_scrip, "40000001");
+        assert_eq!(s.indstocks.strike_count, 10);
+        assert_eq!(s.indstocks.poll_interval_seconds, 5);
+        assert_eq!(s.indstocks.expiry_override, None);
     }
 
     #[test]
@@ -303,5 +357,29 @@ symbol = "NIFTY"
         assert!(s.analysis.max_debate_rounds >= 1);
         assert!(s.analysis.max_risk_discuss_rounds >= 1);
         assert!(s.analysis.reflection_enabled);
+        assert!(!s.indstocks.market_data_enabled);
+    }
+
+    #[test]
+    fn loads_verified_indstocks_settings_from_toml() {
+        let manifest_settings = Path::new(env!("CARGO_MANIFEST_DIR")).join("settings.toml");
+        let s = Settings::load(&manifest_settings).unwrap();
+
+        assert_eq!(s.indstocks.rest_base_url, "https://api.indstocks.com");
+        assert_eq!(
+            s.indstocks.websocket_url,
+            "wss://ws-prices.indstocks.com/api/v1/ws/prices"
+        );
+        assert_eq!(s.indstocks.quote_path, "/market/quotes/full");
+        assert_eq!(s.indstocks.option_chain_path, "/market/option-chain");
+        assert_eq!(s.indstocks.expiries_path, "/market/instruments/expiries");
+        assert_eq!(s.indstocks.exchange, "NSE");
+        assert_eq!(s.indstocks.segment, "INDEX");
+        assert_eq!(s.indstocks.underlying_scrip, "40000001");
+        assert_eq!(s.indstocks.strike_count, 10);
+        assert_eq!(s.indstocks.poll_interval_seconds, 5);
+        assert_eq!(s.indstocks.expiry_override, None);
+        assert!(s.indstocks.market_data_enabled);
+        assert_eq!(s.indstocks.symbol, "NIFTY");
     }
 }
