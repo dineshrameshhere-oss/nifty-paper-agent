@@ -661,7 +661,7 @@ impl TradingAgentsOrchestrator {
         let trader_proposal: TraderProposal = self
             .call_stage(
                 &self.llm.deep_think_model,
-                "[STAGE:TRADER] You are the Trader Agent. From research_decision, position, and snapshot, return TraderProposal JSON (action, rationale, confidence_bps, signal). If flat and proposing BUY, select an exact quoted symbol, quantity=1, and agent-selected option-premium entry_price, target_price, stop_loss_price, trailing_stop_loss_price satisfying 0 < stop_loss_price < trailing_stop_loss_price <= entry_price < target_price. If holding, emit SELL only to close that symbol or signal=null to hold. Never short.",
+                "[STAGE:TRADER] You are the Trader Agent. From research_decision, position, and snapshot, return TraderProposal JSON (action, rationale, confidence_bps, signal). If flat and proposing BUY, copy ONE exact symbol verbatim from snapshot.quotes (never invent or combine symbols like CE+PE), quantity=1, and agent-selected option-premium entry_price, target_price, stop_loss_price, trailing_stop_loss_price satisfying 0 < stop_loss_price < trailing_stop_loss_price <= entry_price < target_price. Include signal fields: id, source, symbol, side, quantity, entry_price, target_price, stop_loss_price, trailing_stop_loss_price, confidence_bps, rationale. If holding, emit SELL only to close that symbol or signal=null to hold. Never short.",
                 &trader_payload,
                 self.llm.max_tokens_decision,
             )
@@ -935,19 +935,48 @@ fn normalize_stage_value(system: &str, mut value: Value) -> Value {
         *v = json!(value_to_u64(v, 1).max(1));
     }
 
+    let parent_conf = map
+        .get("confidence_bps")
+        .or_else(|| map.get("adjusted_confidence_bps"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5000);
+    let parent_rationale = map
+        .get("rationale")
+        .or_else(|| map.get("verdict_rationale"))
+        .map(value_to_string)
+        .unwrap_or_default();
+
     for sig_key in ["signal", "final_signal"] {
         if let Some(v) = map.get_mut(sig_key) {
-            normalize_signal_value(v);
+            normalize_signal_value(v, parent_conf, &parent_rationale);
         }
     }
 
     Value::Object(map)
 }
 
-fn normalize_signal_value(value: &mut Value) {
+fn normalize_signal_value(value: &mut Value, parent_conf: u64, parent_rationale: &str) {
     let Value::Object(map) = value else {
         return;
     };
+    if !map.contains_key("id") || value_to_string(&map["id"]).trim().is_empty() {
+        map.insert("id".into(), json!(format!("ta-{}", uuid::Uuid::new_v4())));
+    }
+    if !map.contains_key("source") || value_to_string(&map["source"]).trim().is_empty() {
+        map.insert("source".into(), json!("trading_agents_trader"));
+    }
+    if !map.contains_key("rationale") || value_to_string(&map["rationale"]).trim().is_empty() {
+        map.insert("rationale".into(), json!(parent_rationale));
+    }
+    if !map.contains_key("confidence_bps") {
+        map.insert("confidence_bps".into(), json!(parent_conf.min(10_000)));
+    }
+    if !map.contains_key("quantity") {
+        map.insert("quantity".into(), json!(1));
+    }
+    if !map.contains_key("snapshot_id") {
+        map.insert("snapshot_id".into(), Value::Null);
+    }
     if let Some(side) = map.get_mut("side") {
         let s = value_to_string(side).to_ascii_lowercase();
         *side = if s.contains("sell") {
@@ -955,6 +984,8 @@ fn normalize_signal_value(value: &mut Value) {
         } else {
             json!("buy")
         };
+    } else {
+        map.insert("side".into(), json!("buy"));
     }
     for key in ["id", "source", "symbol", "rationale"] {
         if let Some(v) = map.get_mut(key) {
@@ -965,7 +996,7 @@ fn normalize_signal_value(value: &mut Value) {
         *v = json!(value_to_u64(v, 1).max(1));
     }
     if let Some(v) = map.get_mut("confidence_bps") {
-        *v = json!(value_to_u64(v, 5000).min(10_000));
+        *v = json!(value_to_u64(v, parent_conf).min(10_000));
     }
     if let Some(v) = map.get_mut("snapshot_id") {
         let ok = v
@@ -1151,5 +1182,27 @@ mod tests {
         let sig = proposal.signal.unwrap();
         assert_eq!(sig.side, Side::Buy);
         assert!(sig.snapshot_id.is_none());
+
+        // Exact minimal signal shape returned by Gemini (omits id, source, side, confidence_bps, rationale, snapshot_id)
+        let minimal_trader = json!({
+            "action": "BUY",
+            "confidence_bps": 6000,
+            "rationale": "Range trade",
+            "signal": {
+                "entry_price": 120.0,
+                "quantity": 1,
+                "stop_loss_price": 90.0,
+                "symbol": "NIFTY-2026-09-01-24350-CE",
+                "target_price": 150.0,
+                "trailing_stop_loss_price": 105.0
+            }
+        });
+        let norm_min = normalize_stage_value("[STAGE:TRADER]", minimal_trader);
+        let proposal_min: TraderProposal = serde_json::from_value(norm_min).unwrap();
+        let sig_min = proposal_min.signal.unwrap();
+        assert!(sig_min.id.starts_with("ta-"));
+        assert_eq!(sig_min.source, "trading_agents_trader");
+        assert_eq!(sig_min.confidence_bps, 6000);
+        assert_eq!(sig_min.rationale, "Range trade");
     }
 }
