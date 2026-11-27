@@ -532,7 +532,10 @@ impl TradingAgentsOrchestrator {
         )
         .await
         .context("TradingAgents stage timed out")??;
-        serde_json::from_value(value).context("decode TradingAgents stage response")
+        let stage = system.split(']').next().unwrap_or("STAGE");
+        let normalized = normalize_stage_value(system, value);
+        serde_json::from_value(normalized.clone())
+            .with_context(|| format!("decode TradingAgents stage response ({stage}]): {normalized}"))
     }
 
     pub async fn decide_with_trace(
@@ -852,6 +855,181 @@ fn strip_markdown_fences(raw: &str) -> &str {
     }
 }
 
+fn normalize_stage_value(system: &str, mut value: Value) -> Value {
+    if let Value::Array(mut arr) = value {
+        value = if arr.len() == 1 {
+            arr.remove(0)
+        } else {
+            Value::Object(serde_json::Map::new())
+        };
+    }
+    let Value::Object(mut map) = value else {
+        return value;
+    };
+    if map.len() == 1 {
+        if let Some((_, inner)) = map.iter().next() {
+            if inner.is_object() {
+                if let Some((_, Value::Object(inner_map))) = map.into_iter().next() {
+                    map = inner_map;
+                } else {
+                    unreachable!();
+                }
+            }
+        }
+    }
+
+    if system.contains("[STAGE:ANALYST_TECHNICAL]") {
+        map.insert("role".into(), json!("technical"));
+    } else if system.contains("[STAGE:ANALYST_OPTIONS]") {
+        map.insert("role".into(), json!("options_volatility"));
+    } else if system.contains("[STAGE:ANALYST_REGIME]") {
+        map.insert("role".into(), json!("regime_sentiment"));
+    }
+
+    for key in [
+        "stance",
+        "summary",
+        "evidence",
+        "speaker",
+        "argument",
+        "thesis",
+        "investment_plan",
+        "action",
+        "rationale",
+        "decision",
+        "verdict_rationale",
+        "lesson_bull",
+        "lesson_bear",
+        "lesson_trader",
+        "lesson_risk",
+        "lesson_summary",
+    ] {
+        if let Some(v) = map.get_mut(key) {
+            *v = json!(value_to_string(v));
+        }
+    }
+
+    if let Some(v) = map.get_mut("preferred_right") {
+        if !v.is_null() {
+            *v = json!(value_to_string(v));
+        }
+    }
+
+    for key in ["key_levels", "regime_tags", "key_risks"] {
+        if let Some(v) = map.get_mut(key) {
+            *v = Value::Array(
+                value_to_string_list(v)
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            );
+        }
+    }
+
+    for key in ["confidence_bps", "adjusted_confidence_bps"] {
+        if let Some(v) = map.get_mut(key) {
+            *v = json!(value_to_u64(v, 5000).min(10_000));
+        }
+    }
+    if let Some(v) = map.get_mut("round") {
+        *v = json!(value_to_u64(v, 1).max(1));
+    }
+
+    for sig_key in ["signal", "final_signal"] {
+        if let Some(v) = map.get_mut(sig_key) {
+            normalize_signal_value(v);
+        }
+    }
+
+    Value::Object(map)
+}
+
+fn normalize_signal_value(value: &mut Value) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    if let Some(side) = map.get_mut("side") {
+        let s = value_to_string(side).to_ascii_lowercase();
+        *side = if s.contains("sell") {
+            json!("sell")
+        } else {
+            json!("buy")
+        };
+    }
+    for key in ["id", "source", "symbol", "rationale"] {
+        if let Some(v) = map.get_mut(key) {
+            *v = json!(value_to_string(v));
+        }
+    }
+    if let Some(v) = map.get_mut("quantity") {
+        *v = json!(value_to_u64(v, 1).max(1));
+    }
+    if let Some(v) = map.get_mut("confidence_bps") {
+        *v = json!(value_to_u64(v, 5000).min(10_000));
+    }
+    if let Some(v) = map.get_mut("snapshot_id") {
+        let ok = v
+            .as_str()
+            .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+            .is_some();
+        if !ok {
+            *v = Value::Null;
+        }
+    }
+}
+
+fn value_to_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn value_to_string_list(v: &Value) -> Vec<String> {
+    match v {
+        Value::Null => Vec::new(),
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![s.clone()]
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .filter(|item| !item.is_null())
+            .map(value_to_string)
+            .collect(),
+        Value::Object(obj) => obj
+            .iter()
+            .map(|(k, val)| format!("{k}: {}", value_to_string(val)))
+            .collect(),
+        other => vec![value_to_string(other)],
+    }
+}
+
+fn value_to_u64(v: &Value, default: u64) -> u64 {
+    if let Some(u) = v.as_u64() {
+        return u;
+    }
+    if let Some(f) = v.as_f64() {
+        if f.is_finite() && f >= 0.0 {
+            return f.round() as u64;
+        }
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(parsed) = s.trim().parse::<f64>() {
+            if parsed.is_finite() && parsed >= 0.0 {
+                return parsed.round() as u64;
+            }
+        }
+    }
+    default
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,5 +1107,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trace2.retrieved_memories.len(), 1);
+    }
+
+    #[test]
+    fn normalizes_messy_llm_json_maps_and_casings() {
+        let raw_analyst = json!({
+            "role": "Technical Analyst",
+            "stance": "bullish",
+            "confidence_bps": 7250.0,
+            "summary": "Momentum up",
+            "key_levels": { "support": 25300, "resistance": 25450 },
+            "evidence": { "spot": 25350 },
+            "regime_tags": "intraday"
+        });
+        let norm = normalize_stage_value("[STAGE:ANALYST_TECHNICAL]", raw_analyst);
+        let report: AnalystReport = serde_json::from_value(norm).unwrap();
+        assert_eq!(report.role, AnalystRole::Technical);
+        assert_eq!(report.confidence_bps, 7250);
+        assert_eq!(report.key_levels.len(), 2);
+        assert_eq!(report.regime_tags, vec!["intraday"]);
+
+        let raw_trader = json!({
+            "action": "BUY",
+            "rationale": "Breakout",
+            "confidence_bps": "7500",
+            "signal": {
+                "id": "sig-1",
+                "source": "trader",
+                "symbol": "NIFTY-2026-11-24-25350-CE",
+                "side": "BUY",
+                "quantity": 1.0,
+                "entry_price": 120.0,
+                "target_price": 150.0,
+                "stop_loss_price": 90.0,
+                "trailing_stop_loss_price": 105.0,
+                "confidence_bps": 7500,
+                "rationale": "Breakout",
+                "snapshot_id": ""
+            }
+        });
+        let norm_t = normalize_stage_value("[STAGE:TRADER]", raw_trader);
+        let proposal: TraderProposal = serde_json::from_value(norm_t).unwrap();
+        let sig = proposal.signal.unwrap();
+        assert_eq!(sig.side, Side::Buy);
+        assert!(sig.snapshot_id.is_none());
     }
 }
