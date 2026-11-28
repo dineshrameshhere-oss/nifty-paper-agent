@@ -540,6 +540,11 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                 trades.len(),
             );
         }
+        // Only call the LLM when flat — no point asking for a new entry while already in a trade.
+        // This reduces Gemini calls from N_bars to N_trades (typically 20-100x fewer calls).
+        if position.is_some() {
+            continue;
+        }
         let Some(signal) = policy.decide(&snapshot, position.as_ref()).await? else {
             continue;
         };
