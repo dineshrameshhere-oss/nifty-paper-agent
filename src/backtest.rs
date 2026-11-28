@@ -405,6 +405,8 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
     let closes: Vec<f64> = bars.iter().map(|b| b.close).collect();
     let last_index = bars.len() - 1;
     let end_bar_index = last_index.min(max_decisions);
+    let run_started = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
     for i in 0..end_bar_index {
         let lookback_start = (i + 1).saturating_sub(config.iv_lookback_bars.max(2));
         let iv = rolling_volatility(
@@ -523,19 +525,26 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
         max_equity = max_equity.max(equity);
         max_dd = max_dd.max(max_equity - equity);
         decisions += 1;
-        // Progress: print every 50 bars so the user can see the backtest is running
-        if decisions % 50 == 1 || decisions == end_bar_index {
+        // Progress: print every 60 seconds of real wall-clock time
+        if last_log.elapsed() >= std::time::Duration::from_secs(60) || decisions == end_bar_index {
+            last_log = std::time::Instant::now();
+            let elapsed_s = run_started.elapsed().as_secs();
             let pct = decisions * 100 / end_bar_index.max(1);
             let pos_str = if position.is_some() { "POSITION" } else { "FLAT" };
             let ts = crate::clock::to_ist(bars[i].timestamp)
                 .format("%d-%b %H:%M")
                 .to_string();
+            let eta_str = if pct > 0 && pct < 100 {
+                let total_est = elapsed_s * 100 / pct as u64;
+                let remaining = total_est.saturating_sub(elapsed_s);
+                format!("ETA ~{}m{}s", remaining / 60, remaining % 60)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[backtest] bar {}/{} ({}%) | {} IST | spot={:.0} | trades={} | {pos_str}",
-                decisions,
-                end_bar_index,
-                pct,
-                ts,
+                "[backtest {:>3}m{:02}s] {pct:>3}% | bar {decisions}/{end_bar_index} | {ts} IST | spot={:.0} | trades={} | {pos_str} {eta_str}",
+                elapsed_s / 60,
+                elapsed_s % 60,
                 bars[i].close,
                 trades.len(),
             );
