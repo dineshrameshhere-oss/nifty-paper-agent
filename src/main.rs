@@ -73,7 +73,10 @@ fn validate_live_paper_prereqs(settings: &Settings, token: &str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .with_ansi(true)
+        .init();
     dotenvy::dotenv().ok();
     let mut settings = Settings::load("settings.toml")?;
     if LIVE_ORDER_PLACEMENT_IMPLEMENTED {

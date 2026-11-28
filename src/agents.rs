@@ -828,6 +828,15 @@ impl BacktestPolicy for TradingAgentsOrchestrator {
         snapshot: &MarketSnapshot,
         position: Option<&BacktestPosition>,
     ) -> Result<Option<Signal>> {
+        let (signal, _) = self.decide_traced(snapshot, position).await?;
+        Ok(signal)
+    }
+
+    async fn decide_traced(
+        &self,
+        snapshot: &MarketSnapshot,
+        position: Option<&BacktestPosition>,
+    ) -> Result<(Option<Signal>, Option<crate::types::PipelineTrace>)> {
         let pos_ctx = position.map(|p| PositionContext {
             symbol: p.symbol.clone(),
             quantity: p.lots,
@@ -841,7 +850,8 @@ impl BacktestPolicy for TradingAgentsOrchestrator {
         let trace = self
             .decide_with_trace(snapshot, pos_ctx.as_ref(), self.journal.as_deref())
             .await?;
-        Ok(trace.final_signal)
+        let signal = trace.final_signal.clone();
+        Ok((signal, Some(trace)))
     }
 
     async fn on_trade_closed(&self, outcome: &TradeOutcome) -> Result<()> {

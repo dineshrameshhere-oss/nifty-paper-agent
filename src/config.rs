@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(s.analysis.max_risk_discuss_rounds, 1);
         assert!(s.analysis.reflection_enabled);
         assert_eq!(s.analysis.max_memory_results, 5);
-        assert_eq!(s.analysis.stage_timeout_seconds, 30);
+        assert_eq!(s.analysis.stage_timeout_seconds, 120);
 
         assert_eq!(s.llm.quick_think_model, "gemini-3.1-flash-lite");
         assert_eq!(s.llm.deep_think_model, "gemini-3.1-flash-lite");

@@ -101,6 +101,17 @@ pub trait BacktestPolicy: Send + Sync {
         position: Option<&BacktestPosition>,
     ) -> Result<Option<Signal>>;
 
+    /// Like decide(), but also returns the full pipeline trace for logging.
+    /// Default impl wraps decide() with no trace — override for detailed logs.
+    async fn decide_traced(
+        &self,
+        snapshot: &MarketSnapshot,
+        position: Option<&BacktestPosition>,
+    ) -> Result<(Option<Signal>, Option<crate::types::PipelineTrace>)> {
+        let signal = self.decide(snapshot, position).await?;
+        Ok((signal, None))
+    }
+
     async fn on_trade_closed(&self, _outcome: &TradeOutcome) -> Result<()> {
         Ok(())
     }
@@ -496,6 +507,17 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                         regime_tags: vec!["nifty".into(), "backtest".into()],
                         decision_rationale: exit_reason.into(),
                     };
+                    crate::log_fmt::print_trade_exit(
+                        &crate::clock::to_ist(bars[i].timestamp)
+                            .format("%d-%b %H:%M IST")
+                            .to_string(),
+                        &outcome.symbol,
+                        &outcome.exit_reason,
+                        outcome.entry_price,
+                        outcome.exit_price,
+                        outcome.pnl_rupees,
+                        outcome.return_bps,
+                    );
                     trades.push(trade);
                     *daily_pnl.entry(bars[i].timestamp.date_naive()).or_default() += pnl;
                     policy.on_trade_closed(&outcome).await?;
@@ -530,7 +552,6 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
             last_log = std::time::Instant::now();
             let elapsed_s = run_started.elapsed().as_secs();
             let pct = decisions * 100 / end_bar_index.max(1);
-            let pos_str = if position.is_some() { "POSITION" } else { "FLAT" };
             let ts = crate::clock::to_ist(bars[i].timestamp)
                 .format("%d-%b %H:%M")
                 .to_string();
@@ -541,12 +562,16 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
             } else {
                 String::new()
             };
-            eprintln!(
-                "[backtest {:>3}m{:02}s] {pct:>3}% | bar {decisions}/{end_bar_index} | {ts} IST | spot={:.0} | trades={} | {pos_str} {eta_str}",
-                elapsed_s / 60,
-                elapsed_s % 60,
+            crate::log_fmt::print_backtest_progress(
+                elapsed_s,
+                pct,
+                decisions,
+                end_bar_index,
+                &ts,
                 bars[i].close,
                 trades.len(),
+                position.is_some(),
+                &eta_str,
             );
         }
         // Only call the LLM when flat — no point asking for a new entry while already in a trade.
@@ -554,7 +579,16 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
         if position.is_some() {
             continue;
         }
-        let Some(signal) = policy.decide(&snapshot, position.as_ref()).await? else {
+        let (maybe_signal, maybe_trace) = policy.decide_traced(&snapshot, position.as_ref()).await?;
+        if let Some(ref trace) = maybe_trace {
+            let label = format!(
+                "{} IST | spot={:.2}",
+                crate::clock::to_ist(bars[i].timestamp).format("%d-%b %H:%M"),
+                bars[i].close
+            );
+            crate::log_fmt::print_pipeline_trace(&label, trace);
+        }
+        let Some(signal) = maybe_signal else {
             continue;
         };
         if crate::risk::check_agent_plan(&signal).is_err() {
@@ -607,6 +641,19 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
                 continue;
             }
             cash -= total;
+            crate::log_fmt::print_trade_entry(
+                &crate::clock::to_ist(next.timestamp)
+                    .format("%d-%b %H:%M IST")
+                    .to_string(),
+                &contract.symbol,
+                lots,
+                fill,
+                signal.target_price,
+                signal.stop_loss_price,
+                signal.trailing_stop_loss_price,
+                fees,
+                &signal.rationale,
+            );
             position = Some(BacktestPosition {
                 symbol: contract.symbol,
                 expiry: contract.expiry,

@@ -5,6 +5,7 @@ pub mod clock;
 pub mod config;
 pub mod data;
 pub mod journal;
+pub mod log_fmt;
 pub mod paper_broker;
 pub mod paper_runner;
 pub mod risk;

@@ -194,7 +194,7 @@ impl IndstocksClient {
                     detail = %e,
                     "INDstocks HTTP send failed"
                 );
-                anyhow::anyhow!("send INDstocks {endpoint} request: [{kind}] {e}")
+                anyhow::Error::new(e).context(format!("send INDstocks {endpoint} request: [{kind}]"))
             })?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();

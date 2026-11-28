@@ -818,9 +818,24 @@ async fn apply_analysis_signal(
                     if let Err(err) = runner.journal.record_fill(&fill) {
                         warn!(symbol = %fill.symbol, error = %err, "failed to record buy fill");
                     }
+                    crate::log_fmt::print_trade_entry(
+                        &to_ist(now).format("%d-%b %H:%M:%S IST").to_string(),
+                        &fill.symbol,
+                        fill.quantity,
+                        fill.price,
+                        sig.target_price,
+                        sig.stop_loss_price,
+                        sig.trailing_stop_loss_price,
+                        fill.fees,
+                        &sig.rationale,
+                    );
                     runner.record_buy_fill(&sig, &fill, &latest_snapshot.context);
                 }
                 Err(err) => {
+                    crate::log_fmt::print_trade_rejected(
+                        &sig.symbol,
+                        &format!("buy signal execution rejected: {err}"),
+                    );
                     warn!(symbol = %sig.symbol, error = %err, "buy signal execution rejected");
                 }
             }
@@ -834,6 +849,15 @@ async fn apply_analysis_signal(
                 now,
             ) {
                 Ok((_fill, outcome)) => {
+                    crate::log_fmt::print_trade_exit(
+                        &to_ist(now).format("%d-%b %H:%M:%S IST").to_string(),
+                        &outcome.symbol,
+                        &outcome.exit_reason,
+                        outcome.entry_price,
+                        outcome.exit_price,
+                        outcome.pnl_rupees,
+                        outcome.return_bps,
+                    );
                     runner.pending_reflections.push(outcome);
                     if let Err(err) = runner.flush_reflections_at(now).await {
                         warn!(error = %err, "failed to flush post-trade reflection");
@@ -1035,7 +1059,11 @@ where
                         if let Some(res) = polled {
                             let apply_now = clock.now();
                             match res {
-                                Ok((_trace, sig)) => {
+                                Ok((trace, sig)) => {
+                                    crate::log_fmt::print_pipeline_trace(
+                                        &to_ist(apply_now).format("%d-%b %H:%M:%S IST").to_string(),
+                                        &trace,
+                                    );
                                     apply_analysis_signal(runner, sig, &snapshot, apply_now).await;
                                 }
                                 Err(err) => {
