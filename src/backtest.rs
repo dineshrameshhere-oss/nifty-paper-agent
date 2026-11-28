@@ -523,6 +523,23 @@ pub async fn run_agent_backtest<P: BacktestPolicy>(
         max_equity = max_equity.max(equity);
         max_dd = max_dd.max(max_equity - equity);
         decisions += 1;
+        // Progress: print every 50 bars so the user can see the backtest is running
+        if decisions % 50 == 1 || decisions == end_bar_index {
+            let pct = decisions * 100 / end_bar_index.max(1);
+            let pos_str = if position.is_some() { "POSITION" } else { "FLAT" };
+            let ts = crate::clock::to_ist(bars[i].timestamp)
+                .format("%d-%b %H:%M")
+                .to_string();
+            eprintln!(
+                "[backtest] bar {}/{} ({}%) | {} IST | spot={:.0} | trades={} | {pos_str}",
+                decisions,
+                end_bar_index,
+                pct,
+                ts,
+                bars[i].close,
+                trades.len(),
+            );
+        }
         let Some(signal) = policy.decide(&snapshot, position.as_ref()).await? else {
             continue;
         };
